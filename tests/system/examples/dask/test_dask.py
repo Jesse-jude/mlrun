@@ -18,8 +18,6 @@ import os
 import kfp
 import kfp.compiler
 import pytest
-from mlrun_pipelines.common.models import RunStatuses
-from mlrun_pipelines.mounts import mount_v3io
 
 import mlrun.common.constants as mlrun_constants
 import mlrun.utils
@@ -29,6 +27,8 @@ from mlrun import (
     new_task,
     wait_for_pipeline_completion,
 )
+from mlrun.runtimes.mounts import mount_v3io
+from mlrun_pipelines.common.models import RunStatuses
 from tests.system.base import TestMLRunSystem
 
 
@@ -44,7 +44,7 @@ class TestDask(TestMLRunSystem):
             filename=str(self.assets_path / "dask_function.py"),
         ).apply(mount_v3io())
 
-        self.dask_function.spec.image = "mlrun/ml-base"
+        self.dask_function.spec.image = "mlrun/mlrun"
         self.dask_function.spec.remote = True
         self.dask_function.spec.replicas = 1
         self.dask_function.spec.service_type = "NodePort"
@@ -159,7 +159,7 @@ class TestDask(TestMLRunSystem):
         # wait for the dask cluster to completely shut down
         mlrun.utils.retry_until_successful(
             5,
-            60,
+            5 * 60,
             self._logger,
             True,
             self._wait_for_dask_cluster_to_shutdown,
@@ -183,6 +183,10 @@ class TestDask(TestMLRunSystem):
         resources = runtime_resources[0].resources
         # Waiting for workers to be removed and scheduler status to completed
         if len(resources.pod_resources) > 1:
+            self._logger.info(
+                "Waiting for cluster to shut down",
+                pod_resources=resources.pod_resources,
+            )
             raise mlrun.errors.MLRunRuntimeError("Cluster did not completely clean up")
 
         for pod in resources.pod_resources:

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 from dataclasses import dataclass
 from typing import Final, Optional, Protocol, Union, cast
 
@@ -25,13 +24,13 @@ import mlrun.model_monitoring.applications.context as mm_context
 import mlrun.model_monitoring.applications.results as mm_results
 import mlrun.model_monitoring.features_drift_table as mm_drift_table
 from mlrun.common.schemas.model_monitoring.constants import (
-    EventFieldType,
     HistogramDataDriftApplicationConstants,
     ResultKindApp,
     ResultStatusApp,
+    StatsKind,
 )
 from mlrun.model_monitoring.applications import (
-    ModelMonitoringApplicationBaseV2,
+    ModelMonitoringApplicationBase,
 )
 from mlrun.model_monitoring.metrics.histogram_distance import (
     HellingerDistance,
@@ -87,11 +86,13 @@ class DataDriftClassifier:
         return ResultStatusApp.no_detection
 
 
-class HistogramDataDriftApplication(ModelMonitoringApplicationBaseV2):
+class HistogramDataDriftApplication(ModelMonitoringApplicationBase):
     """
     MLRun's default data drift application for model monitoring.
 
-    The application expects tabular numerical data, and calculates three metrics over the features' histograms.
+    The application expects tabular numerical data, and calculates three metrics over the shared features' histograms.
+    The metrics are calculated on features that have reference data from the training dataset. When there is no
+    reference data (`feature_stats`), this application send a warning log and does nothing.
     The three metrics are:
 
     * Hellinger distance.
@@ -101,10 +102,10 @@ class HistogramDataDriftApplication(ModelMonitoringApplicationBaseV2):
     Each metric is calculated over all the features individually and the mean is taken as the metric value.
     The average of Hellinger and total variance distance is taken as the result.
 
-    The application logs two artifacts:
+    The application can log two artifacts:
 
-    * A JSON with the general drift per feature.
-    * A plotly table different metrics per feature.
+    * JSON with the general drift value per feature, produced by default.
+    * Plotly table with the various metrics and histograms per feature (disabled by default due to performance issues).
 
     This application is deployed by default when calling:
 
@@ -112,11 +113,19 @@ class HistogramDataDriftApplication(ModelMonitoringApplicationBaseV2):
 
         project.enable_model_monitoring()
 
+    To avoid it, pass :code:`deploy_histogram_data_drift_app=False`.
+
+    If you want to change the application defaults, such as the classifier or which artifacts to produce, you
+    need to inherit from this class and deploy it as any other model monitoring application.
     """
 
     NAME: Final[str] = HistogramDataDriftApplicationConstants.NAME
 
     _REQUIRED_METRICS = {HellingerDistance, TotalVarianceDistance}
+    _STATS_TYPES: tuple[StatsKind, StatsKind] = (
+        StatsKind.CURRENT_STATS,
+        StatsKind.DRIFT_MEASURES,
+    )
 
     metrics: list[type[HistogramDistanceMetric]] = [
         HellingerDistance,
@@ -124,7 +133,12 @@ class HistogramDataDriftApplication(ModelMonitoringApplicationBaseV2):
         TotalVarianceDistance,
     ]
 
-    def __init__(self, value_classifier: Optional[ValueClassifier] = None) -> None:
+    def __init__(
+        self,
+        value_classifier: Optional[ValueClassifier] = None,
+        produce_json_artifact: bool = True,
+        produce_plotly_artifact: bool = False,
+    ) -> None:
         """
         :param value_classifier: Classifier object that adheres to the `ValueClassifier` protocol.
                                  If not provided, the default `DataDriftClassifier()` is used.
@@ -133,6 +147,9 @@ class HistogramDataDriftApplication(ModelMonitoringApplicationBaseV2):
         assert self._REQUIRED_METRICS <= set(
             self.metrics
         ), "TVD and Hellinger distance are required for the general data drift result"
+
+        self._produce_json_artifact = produce_json_artifact
+        self._produce_plotly_artifact = produce_plotly_artifact
 
     def _compute_metrics_per_feature(
         self, monitoring_context: mm_context.MonitoringApplicationContext
@@ -186,21 +203,12 @@ class HistogramDataDriftApplication(ModelMonitoringApplicationBaseV2):
         )
 
         status = self._value_classifier.value_to_status(value)
+
         return mm_results.ModelMonitoringApplicationResult(
             name=HistogramDataDriftApplicationConstants.GENERAL_RESULT_NAME,
             value=value,
             kind=ResultKindApp.data_drift,
             status=status,
-            extra_data={
-                EventFieldType.CURRENT_STATS: json.dumps(
-                    monitoring_context.sample_df_stats
-                ),
-                EventFieldType.DRIFT_MEASURES: json.dumps(
-                    metrics_per_feature.T.to_dict()
-                    | {metric.name: metric.value for metric in metrics}
-                ),
-                EventFieldType.DRIFT_STATUS: status.value,
-            },
         )
 
     @staticmethod
@@ -223,19 +231,47 @@ class HistogramDataDriftApplication(ModelMonitoringApplicationBaseV2):
         return metrics
 
     @staticmethod
-    def _remove_timestamp_feature(
-        sample_set_statistics: mlrun.common.model_monitoring.helpers.FeatureStats,
+    def _get_stats(
+        metrics: list[mm_results.ModelMonitoringApplicationMetric],
+        metrics_per_feature: DataFrame,
+        monitoring_context: mm_context.MonitoringApplicationContext,
+    ) -> list[mm_results._ModelMonitoringApplicationStats]:
+        """
+        list the application calculated stats
+        :param metrics: the calculated metrics
+        :param metrics_per_feature: metric calculated per feature
+        :param monitoring_context:  context object for current monitoring application
+        :returns: list of mm_results._ModelMonitoringApplicationStats for histogram data drift application
+        """
+        stats = []
+        for stats_type in HistogramDataDriftApplication._STATS_TYPES:
+            stats.append(
+                mm_results._ModelMonitoringApplicationStats(
+                    name=stats_type,
+                    stats=metrics_per_feature.T.to_dict()
+                    | {metric.name: metric.value for metric in metrics}
+                    if stats_type == StatsKind.DRIFT_MEASURES
+                    else monitoring_context.sample_df_stats,
+                    timestamp=monitoring_context.end_infer_time.isoformat(
+                        sep=" ", timespec="microseconds"
+                    ),
+                )
+            )
+        return stats
+
+    @staticmethod
+    def _get_shared_features_sample_stats(
+        monitoring_context: mm_context.MonitoringApplicationContext,
     ) -> mlrun.common.model_monitoring.helpers.FeatureStats:
         """
-        Drop the 'timestamp' feature if it exists, as it is irrelevant
-        in the plotly artifact
+        Filter out features without reference data in `feature_stats`, e.g. `timestamp`.
         """
-        sample_set_statistics = mlrun.common.model_monitoring.helpers.FeatureStats(
-            sample_set_statistics.copy()
+        return mlrun.common.model_monitoring.helpers.FeatureStats(
+            {
+                key: monitoring_context.sample_df_stats[key]
+                for key in monitoring_context.feature_stats
+            }
         )
-        if EventFieldType.TIMESTAMP in sample_set_statistics:
-            del sample_set_statistics[EventFieldType.TIMESTAMP]
-        return sample_set_statistics
 
     @staticmethod
     def _log_json_artifact(
@@ -273,59 +309,59 @@ class HistogramDataDriftApplication(ModelMonitoringApplicationBaseV2):
             cast(str, key): (self._value_classifier.value_to_status(value), value)
             for key, value in drift_per_feature_values.items()
         }
-        monitoring_context.logger.debug("Logging plotly artifact")
-        monitoring_context.log_artifact(
-            mm_drift_table.FeaturesDriftTablePlot().produce(
-                sample_set_statistics=sample_set_statistics,
-                inputs_statistics=inputs_statistics,
-                metrics=metrics_per_feature.T.to_dict(),  # pyright: ignore[reportArgumentType]
-                drift_results=drift_results,
-            )
+        monitoring_context.logger.debug("Producing plotly artifact")
+        artifact = mm_drift_table.FeaturesDriftTablePlot().produce(
+            sample_set_statistics=sample_set_statistics,
+            inputs_statistics=inputs_statistics,
+            metrics=metrics_per_feature.T.to_dict(),  # pyright: ignore[reportArgumentType]
+            drift_results=drift_results,
         )
+        monitoring_context.logger.debug("Logging plotly artifact")
+        monitoring_context.log_artifact(artifact)
         monitoring_context.logger.debug("Logged plotly artifact successfully")
 
     def _log_drift_artifacts(
         self,
         monitoring_context: mm_context.MonitoringApplicationContext,
         metrics_per_feature: DataFrame,
-        log_json_artifact: bool = True,
     ) -> None:
         """Log JSON and Plotly drift data per feature artifacts"""
+        if not self._produce_json_artifact and not self._produce_plotly_artifact:
+            return
+
         drift_per_feature_values = metrics_per_feature[
             [HellingerDistance.NAME, TotalVarianceDistance.NAME]
         ].mean(axis=1)
 
-        if log_json_artifact:
+        if self._produce_json_artifact:
             self._log_json_artifact(drift_per_feature_values, monitoring_context)
 
-        self._log_plotly_table_artifact(
-            sample_set_statistics=self._remove_timestamp_feature(
-                monitoring_context.sample_df_stats
-            ),
-            inputs_statistics=monitoring_context.feature_stats,
-            metrics_per_feature=metrics_per_feature,
-            drift_per_feature_values=drift_per_feature_values,
-            monitoring_context=monitoring_context,
-        )
+        if self._produce_plotly_artifact:
+            self._log_plotly_table_artifact(
+                sample_set_statistics=self._get_shared_features_sample_stats(
+                    monitoring_context
+                ),
+                inputs_statistics=monitoring_context.feature_stats,
+                metrics_per_feature=metrics_per_feature,
+                drift_per_feature_values=drift_per_feature_values,
+                monitoring_context=monitoring_context,
+            )
 
     def do_tracking(
-        self,
-        monitoring_context: mm_context.MonitoringApplicationContext,
+        self, monitoring_context: mm_context.MonitoringApplicationContext
     ) -> list[
         Union[
             mm_results.ModelMonitoringApplicationResult,
             mm_results.ModelMonitoringApplicationMetric,
+            mm_results._ModelMonitoringApplicationStats,
         ]
     ]:
         """
         Calculate and return the data drift metrics, averaged over the features.
-
-        Refer to `ModelMonitoringApplicationBaseV2` for the meaning of the
-        function arguments.
         """
         monitoring_context.logger.debug("Starting to run the application")
         if not monitoring_context.feature_stats:
-            monitoring_context.logger.info(
+            monitoring_context.logger.warning(
                 "No feature statistics found, skipping the application. \n"
                 "In order to run the application, training set must be provided when logging the model."
             )
@@ -345,8 +381,13 @@ class HistogramDataDriftApplication(ModelMonitoringApplicationBaseV2):
             monitoring_context=monitoring_context,
             metrics_per_feature=metrics_per_feature,
         )
-        metrics_and_result = metrics + [result]
-        monitoring_context.logger.debug(
-            "Finished running the application", results=metrics_and_result
+        stats = self._get_stats(
+            metrics=metrics,
+            monitoring_context=monitoring_context,
+            metrics_per_feature=metrics_per_feature,
         )
-        return metrics_and_result
+        metrics_result_and_stats = metrics + [result] + stats
+        monitoring_context.logger.debug(
+            "Finished running the application", results=metrics_result_and_stats
+        )
+        return metrics_result_and_stats

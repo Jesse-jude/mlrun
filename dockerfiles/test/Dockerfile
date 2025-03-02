@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ARG MLRUN_PYTHON_VERSION=3.9
+ARG MLRUN_UV_IMAGE=ghcr.io/astral-sh/uv:latest
 
+FROM ${MLRUN_UV_IMAGE} AS uv-image
 FROM gcr.io/iguazio/python:${MLRUN_PYTHON_VERSION}-slim
 
-ENV PIP_NO_CACHE_DIR=1
+ENV NO_COLOR=1
 
 LABEL maintainer="yaronh@iguazio.com"
 LABEL org="iguazio.com"
@@ -45,36 +47,25 @@ RUN git config --global user.email "test@mlrun.org" \
      && git config --global user.name "MLRun Test" \
      && git config --global init.defaultBranch "main"
 
-ARG MLRUN_PIP_VERSION=24.0
+ARG MLRUN_PIP_VERSION=25.0
 RUN python -m pip install --upgrade pip~=${MLRUN_PIP_VERSION}
 
 WORKDIR /mlrun
 
-COPY ./requirements.txt ./
-COPY ./extras-requirements.txt ./extras-requirements.txt
-COPY ./dockerfiles/mlrun-api/requirements.txt ./mlrun-api-requirements.txt
-COPY ./dev-requirements.txt ./
-COPY ./docs/requirements.txt ./docs-requirements.txt
-
-RUN pip install \
-    -r requirements.txt \
-    -r extras-requirements.txt \
-    -r mlrun-api-requirements.txt
-
-# if we give all the requirements together pip resolver go nuts so separating between the package and the image
-# requirements
-COPY ./dev-requirements.txt ./
-RUN python -m pip install \
-    -r dev-requirements.txt
-
-COPY ./docs/requirements.txt ./docs-requirements.txt
-RUN python -m pip install \
-    -r docs-requirements.txt
+ENV UV_SYSTEM_PYTHON=true UV_LINK_MODE=copy
+ARG MLRUN_PYTHON_VERSION=3.9
+# explicitly set the python version to ensure uv installs the correct version
+# as per the python version or we will handle situtations where python 3.11 tries to install
+# kfp 1.8 *even though it is explicitly set on locked file that kfp 1.8 is for python < 3.11*
+RUN --mount=from=uv-image,source=/uv,target=/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=dockerfiles/test/locked-requirements.txt,target=locked-requirements.txt \
+    uv pip sync --require-hashes locked-requirements.txt --python-version ${MLRUN_PYTHON_VERSION}
 
 COPY . .
 
-RUN pip install -e .[complete] &&\
-    pip install -e ./pipeline-adapters/mlrun-pipelines-kfp-common &&\
-    pip install -e ./pipeline-adapters/mlrun-pipelines-kfp-v1-8
+RUN rm -rf ./server/go
 
-ENV NO_COLOR=1
+RUN --mount=from=uv-image,source=/uv,target=/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv pip install .[complete] --python-version ${MLRUN_PYTHON_VERSION}

@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from io import StringIO
 from typing import Optional, Union
 
+import taosws
+
 import mlrun.common.schemas.model_monitoring as mm_schemas
 import mlrun.common.types
 
@@ -24,9 +26,12 @@ _MODEL_MONITORING_DATABASE = "mlrun_model_monitoring"
 
 
 class _TDEngineColumnType:
-    def __init__(self, data_type: str, length: int = None):
+    def __init__(self, data_type: str, length: Optional[int] = None):
         self.data_type = data_type
         self.length = length
+
+    def values_to_column(self, values):
+        raise NotImplementedError()
 
     def __str__(self):
         if self.length is not None:
@@ -41,7 +46,27 @@ class _TDEngineColumn(mlrun.common.types.StrEnum):
     INT = _TDEngineColumnType("INT")
     BINARY_40 = _TDEngineColumnType("BINARY", 40)
     BINARY_64 = _TDEngineColumnType("BINARY", 64)
-    BINARY_10000 = _TDEngineColumnType("BINARY", 10000)
+    BINARY_1000 = _TDEngineColumnType("BINARY", 1000)
+
+
+def values_to_column(values, column_type):
+    if column_type == _TDEngineColumn.TIMESTAMP:
+        timestamps = [round(timestamp.timestamp() * 1000) for timestamp in values]
+        return taosws.millis_timestamps_to_column(timestamps)
+    if column_type == _TDEngineColumn.FLOAT:
+        return taosws.floats_to_column(values)
+    if column_type == _TDEngineColumn.INT:
+        return taosws.ints_to_column(values)
+    if column_type == _TDEngineColumn.BINARY_40:
+        return taosws.binary_to_column(values)
+    if column_type == _TDEngineColumn.BINARY_64:
+        return taosws.binary_to_column(values)
+    if column_type == _TDEngineColumn.BINARY_1000:
+        return taosws.binary_to_column(values)
+
+    raise mlrun.errors.MLRunInvalidArgumentError(
+        f"unsupported column type '{column_type}'"
+    )
 
 
 @dataclass
@@ -55,39 +80,33 @@ class TDEngineSchema:
     def __init__(
         self,
         super_table: str,
-        columns: dict[str, str],
+        columns: dict[str, _TDEngineColumn],
         tags: dict[str, str],
+        project: str,
+        database: Optional[str] = None,
     ):
-        self.super_table = super_table
+        self.super_table = f"{super_table}_{project.replace('-', '_')}"
         self.columns = columns
         self.tags = tags
-        self.database = _MODEL_MONITORING_DATABASE
+        self.database = database or _MODEL_MONITORING_DATABASE
 
     def _create_super_table_query(self) -> str:
         columns = ", ".join(f"{col} {val}" for col, val in self.columns.items())
         tags = ", ".join(f"{col} {val}" for col, val in self.tags.items())
         return f"CREATE STABLE if NOT EXISTS {self.database}.{self.super_table} ({columns}) TAGS ({tags});"
 
-    def _create_subtable_query(
+    def _create_subtable_sql(
         self,
         subtable: str,
         values: dict[str, Union[str, int, float, datetime.datetime]],
     ) -> str:
         try:
-            values = ", ".join(f"'{values[val]}'" for val in self.tags)
+            tags = ", ".join(f"'{values[val]}'" for val in self.tags)
         except KeyError:
             raise mlrun.errors.MLRunInvalidArgumentError(
                 f"values must contain all tags: {self.tags.keys()}"
             )
-        return f"CREATE TABLE if NOT EXISTS {self.database}.{subtable} USING {self.super_table} TAGS ({values});"
-
-    def _insert_subtable_query(
-        self,
-        subtable: str,
-        values: dict[str, Union[str, int, float, datetime.datetime]],
-    ) -> str:
-        values = ", ".join(f"'{values[val]}'" for val in self.columns)
-        return f"INSERT INTO {self.database}.{subtable} VALUES ({values});"
+        return f"CREATE TABLE if NOT EXISTS {self.database}.{subtable} USING {self.super_table} TAGS ({tags});"
 
     def _delete_subtable_query(
         self,
@@ -109,6 +128,9 @@ class TDEngineSchema:
     ) -> str:
         return f"DROP TABLE if EXISTS {self.database}.{subtable};"
 
+    def drop_supertable_query(self) -> str:
+        return f"DROP STABLE if EXISTS {self.database}.{self.super_table};"
+
     def _get_subtables_query(
         self,
         values: dict[str, Union[str, int, float, datetime.datetime]],
@@ -120,14 +142,14 @@ class TDEngineSchema:
             raise mlrun.errors.MLRunInvalidArgumentError(
                 f"values must contain at least one tag: {self.tags.keys()}"
             )
-        return f"SELECT tbname FROM {self.database}.{self.super_table} WHERE {values};"
+        return f"SELECT DISTINCT tbname FROM {self.database}.{self.super_table} WHERE {values};"
 
     @staticmethod
     def _get_records_query(
         table: str,
-        start: datetime,
-        end: datetime,
-        columns_to_filter: list[str] = None,
+        start: datetime.datetime,
+        end: datetime.datetime,
+        columns_to_filter: Optional[list[str]] = None,
         filter_query: Optional[str] = None,
         interval: Optional[str] = None,
         limit: int = 0,
@@ -135,6 +157,10 @@ class TDEngineSchema:
         sliding_window_step: Optional[str] = None,
         timestamp_column: str = "time",
         database: str = _MODEL_MONITORING_DATABASE,
+        group_by: Optional[Union[list[str], str]] = None,
+        preform_agg_funcs_columns: Optional[list[str]] = None,
+        order_by: Optional[str] = None,
+        desc: Optional[bool] = None,
     ) -> str:
         if agg_funcs and not columns_to_filter:
             raise mlrun.errors.MLRunInvalidArgumentError(
@@ -151,15 +177,37 @@ class TDEngineSchema:
             raise mlrun.errors.MLRunInvalidArgumentError(
                 "`interval` must be provided when using sliding window"
             )
+        if group_by and not agg_funcs:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                "aggregate functions must be provided when using group by"
+            )
+        if desc and not order_by:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                "`order_by` must be provided when using descending"
+            )
 
         with StringIO() as query:
             query.write("SELECT ")
             if interval:
                 query.write("_wstart, _wend, ")
             if agg_funcs:
+                preform_agg_funcs_columns = (
+                    columns_to_filter
+                    if preform_agg_funcs_columns is None
+                    else preform_agg_funcs_columns
+                )
                 query.write(
                     ", ".join(
-                        [f"{a}({col})" for a in agg_funcs for col in columns_to_filter]
+                        [
+                            f"{a}({col})"
+                            if col.upper()
+                            in map(
+                                str.upper, preform_agg_funcs_columns
+                            )  # Case-insensitive check
+                            else f"{col}"
+                            for a in agg_funcs
+                            for col in columns_to_filter
+                        ]
                     )
                 )
             elif columns_to_filter:
@@ -173,9 +221,16 @@ class TDEngineSchema:
                 if filter_query:
                     query.write(f"{filter_query} AND ")
                 if start:
-                    query.write(f"{timestamp_column} >= '{start}'" + " AND ")
+                    query.write(f"{timestamp_column} >= '{start}' AND ")
                 if end:
                     query.write(f"{timestamp_column} <= '{end}'")
+            if group_by:
+                if isinstance(group_by, list):
+                    group_by = ", ".join(group_by)
+                query.write(f" GROUP BY {group_by}")
+            if order_by:
+                desc = " DESC" if desc else ""
+                query.write(f" ORDER BY {order_by}{desc}")
             if interval:
                 query.write(f" INTERVAL({interval})")
             if sliding_window_step:
@@ -188,53 +243,92 @@ class TDEngineSchema:
 
 @dataclass
 class AppResultTable(TDEngineSchema):
-    super_table = mm_schemas.TDEngineSuperTables.APP_RESULTS
-    columns = {
-        mm_schemas.WriterEvent.END_INFER_TIME: _TDEngineColumn.TIMESTAMP,
-        mm_schemas.WriterEvent.START_INFER_TIME: _TDEngineColumn.TIMESTAMP,
-        mm_schemas.ResultData.RESULT_VALUE: _TDEngineColumn.FLOAT,
-        mm_schemas.ResultData.RESULT_STATUS: _TDEngineColumn.INT,
-        mm_schemas.ResultData.CURRENT_STATS: _TDEngineColumn.BINARY_10000,
-    }
-
-    tags = {
-        mm_schemas.EventFieldType.PROJECT: _TDEngineColumn.BINARY_64,
-        mm_schemas.WriterEvent.ENDPOINT_ID: _TDEngineColumn.BINARY_64,
-        mm_schemas.WriterEvent.APPLICATION_NAME: _TDEngineColumn.BINARY_64,
-        mm_schemas.ResultData.RESULT_NAME: _TDEngineColumn.BINARY_64,
-        mm_schemas.ResultData.RESULT_KIND: _TDEngineColumn.INT,
-    }
-    database = _MODEL_MONITORING_DATABASE
+    def __init__(self, project: str, database: Optional[str] = None):
+        super_table = mm_schemas.TDEngineSuperTables.APP_RESULTS
+        columns = {
+            mm_schemas.WriterEvent.END_INFER_TIME: _TDEngineColumn.TIMESTAMP,
+            mm_schemas.WriterEvent.START_INFER_TIME: _TDEngineColumn.TIMESTAMP,
+            mm_schemas.ResultData.RESULT_VALUE: _TDEngineColumn.FLOAT,
+            mm_schemas.ResultData.RESULT_STATUS: _TDEngineColumn.INT,
+            mm_schemas.ResultData.RESULT_EXTRA_DATA: _TDEngineColumn.BINARY_1000,
+        }
+        tags = {
+            mm_schemas.WriterEvent.ENDPOINT_ID: _TDEngineColumn.BINARY_64,
+            mm_schemas.WriterEvent.APPLICATION_NAME: _TDEngineColumn.BINARY_64,
+            mm_schemas.ResultData.RESULT_NAME: _TDEngineColumn.BINARY_64,
+            mm_schemas.ResultData.RESULT_KIND: _TDEngineColumn.INT,
+        }
+        super().__init__(
+            super_table=super_table,
+            columns=columns,
+            tags=tags,
+            database=database,
+            project=project,
+        )
 
 
 @dataclass
 class Metrics(TDEngineSchema):
-    super_table = mm_schemas.TDEngineSuperTables.METRICS
-    columns = {
-        mm_schemas.WriterEvent.END_INFER_TIME: _TDEngineColumn.TIMESTAMP,
-        mm_schemas.WriterEvent.START_INFER_TIME: _TDEngineColumn.TIMESTAMP,
-        mm_schemas.MetricData.METRIC_VALUE: _TDEngineColumn.FLOAT,
-    }
-
-    tags = {
-        mm_schemas.EventFieldType.PROJECT: _TDEngineColumn.BINARY_64,
-        mm_schemas.WriterEvent.ENDPOINT_ID: _TDEngineColumn.BINARY_64,
-        mm_schemas.WriterEvent.APPLICATION_NAME: _TDEngineColumn.BINARY_64,
-        mm_schemas.MetricData.METRIC_NAME: _TDEngineColumn.BINARY_64,
-    }
-    database = _MODEL_MONITORING_DATABASE
+    def __init__(self, project: str, database: Optional[str] = None):
+        super_table = mm_schemas.TDEngineSuperTables.METRICS
+        columns = {
+            mm_schemas.WriterEvent.END_INFER_TIME: _TDEngineColumn.TIMESTAMP,
+            mm_schemas.WriterEvent.START_INFER_TIME: _TDEngineColumn.TIMESTAMP,
+            mm_schemas.MetricData.METRIC_VALUE: _TDEngineColumn.FLOAT,
+        }
+        tags = {
+            mm_schemas.WriterEvent.ENDPOINT_ID: _TDEngineColumn.BINARY_64,
+            mm_schemas.WriterEvent.APPLICATION_NAME: _TDEngineColumn.BINARY_64,
+            mm_schemas.MetricData.METRIC_NAME: _TDEngineColumn.BINARY_64,
+        }
+        super().__init__(
+            super_table=super_table,
+            columns=columns,
+            tags=tags,
+            database=database,
+            project=project,
+        )
 
 
 @dataclass
 class Predictions(TDEngineSchema):
-    super_table = mm_schemas.TDEngineSuperTables.PREDICTIONS
-    columns = {
-        mm_schemas.EventFieldType.TIME: _TDEngineColumn.TIMESTAMP,
-        mm_schemas.EventFieldType.LATENCY: _TDEngineColumn.FLOAT,
-        mm_schemas.EventKeyMetrics.CUSTOM_METRICS: _TDEngineColumn.BINARY_10000,
-    }
-    tags = {
-        mm_schemas.EventFieldType.PROJECT: _TDEngineColumn.BINARY_64,
-        mm_schemas.WriterEvent.ENDPOINT_ID: _TDEngineColumn.BINARY_64,
-    }
-    database = _MODEL_MONITORING_DATABASE
+    def __init__(self, project: str, database: Optional[str] = None):
+        super_table = mm_schemas.TDEngineSuperTables.PREDICTIONS
+        columns = {
+            mm_schemas.EventFieldType.TIME: _TDEngineColumn.TIMESTAMP,
+            mm_schemas.EventFieldType.LATENCY: _TDEngineColumn.FLOAT,
+            mm_schemas.EventKeyMetrics.CUSTOM_METRICS: _TDEngineColumn.BINARY_1000,
+            mm_schemas.EventFieldType.ESTIMATED_PREDICTION_COUNT: _TDEngineColumn.FLOAT,
+            mm_schemas.EventFieldType.EFFECTIVE_SAMPLE_COUNT: _TDEngineColumn.INT,
+        }
+        tags = {
+            mm_schemas.WriterEvent.ENDPOINT_ID: _TDEngineColumn.BINARY_64,
+        }
+        super().__init__(
+            super_table=super_table,
+            columns=columns,
+            tags=tags,
+            database=database,
+            project=project,
+        )
+
+
+@dataclass
+class Errors(TDEngineSchema):
+    def __init__(self, project: str, database: Optional[str] = None):
+        super_table = mm_schemas.TDEngineSuperTables.ERRORS
+        columns = {
+            mm_schemas.EventFieldType.TIME: _TDEngineColumn.TIMESTAMP,
+            mm_schemas.EventFieldType.MODEL_ERROR: _TDEngineColumn.BINARY_1000,
+        }
+        tags = {
+            mm_schemas.WriterEvent.ENDPOINT_ID: _TDEngineColumn.BINARY_64,
+            mm_schemas.EventFieldType.ERROR_TYPE: _TDEngineColumn.BINARY_64,
+        }
+        super().__init__(
+            super_table=super_table,
+            columns=columns,
+            tags=tags,
+            database=database,
+            project=project,
+        )

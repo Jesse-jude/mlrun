@@ -15,6 +15,7 @@
 import os
 import os.path
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -79,6 +80,12 @@ for authentication_method in AUTH_METHODS_AND_REQUIRED_PARAMS:
         generated_pytest_parameters.append((authentication_method, True))
 
 
+def pop_env():
+    for k, env_vars in AUTH_METHODS_AND_REQUIRED_PARAMS.items():
+        for env_var in env_vars:
+            os.environ.pop(env_var, None)
+
+
 # Apply parametrization to all tests in this file. Skip test if auth method is not configured.
 @pytest.mark.skipif(
     not config.get("env", {}).get("AZURE_CONTAINER"),
@@ -112,19 +119,14 @@ class TestAzureBlob:
 
     @classmethod
     def teardown_class(cls):
+        store_manager.reset_secrets()
+        pop_env()
         test_dir = f"{cls.bucket_name}/{cls.test_dir}"
         if not cls._azure_fs:
             return
         if cls._azure_fs.exists(test_dir):
             cls._azure_fs.delete(test_dir, recursive=True)
             logger.debug("test directory has been deleted.")
-
-    def teardown_method(self, method):
-        for auth, auth_list in AUTH_METHODS_AND_REQUIRED_PARAMS.items():
-            if auth.startswith("env"):
-                for env_parameter in auth_list:
-                    if config["env"].get(env_parameter, None):
-                        os.environ[env_parameter] = config["env"].get(env_parameter)
 
     @classmethod
     def create_fs(cls, storage_options):
@@ -143,15 +145,10 @@ class TestAzureBlob:
         self.run_dir_url = f"{self._bucket_url}/{self.run_dir}"
         self.object_url = f"{self.run_dir_url}{self.object_file}"
 
-    def pop_env(self):
-        for k, env_vars in AUTH_METHODS_AND_REQUIRED_PARAMS.items():
-            for env_var in env_vars:
-                os.environ.pop(env_var, None)
-
     def setup_before_test(self, use_datastore_profile, auth_method, fake_secrets=False):
         store_manager.reset_secrets()
         self.storage_options = {}
-        self.pop_env()
+        pop_env()
         self.build_object_url(use_datastore_profile)
         test_params = AUTH_METHODS_AND_REQUIRED_PARAMS.get(auth_method)
 
@@ -246,17 +243,101 @@ class TestAzureBlob:
         assert self.object_file.split("/")[-1] not in dir_dataitem.listdir()
         file_dataitem.delete()  # should not raise an error
 
-    @pytest.mark.parametrize("use_datastore_profile", (True, False))
-    def test_blob_upload(self, use_datastore_profile):
+    @pytest.mark.parametrize(
+        "auth_method ,use_datastore_profile", generated_pytest_parameters
+    )
+    def test_blob_upload(self, use_datastore_profile, auth_method):
+        # The upload is done by a different connector than fsspec, so it requires checking every authentication method.
         self.setup_before_test(
-            use_datastore_profile=use_datastore_profile,
-            auth_method="fsspec_conn_str" if use_datastore_profile else "env_conn_str",
+            use_datastore_profile=use_datastore_profile, auth_method=auth_method
         )
         upload_data_item = mlrun.run.get_dataitem(self.object_url, self.storage_options)
         upload_data_item.upload(self.test_file)
 
         response = upload_data_item.get()
         assert response.decode() == self.test_string
+
+    @pytest.mark.parametrize("data", [b"test", bytearray(b"test")])
+    def test_put_types(
+        self,
+        data,
+    ):
+        self.setup_before_test(
+            use_datastore_profile=False,
+            auth_method="env_conn_str",
+        )
+        data_item = mlrun.run.get_dataitem(
+            self.object_url, secrets=self.storage_options
+        )
+        data_item.put(data)
+        result = data_item.get()
+        assert result == b"test"
+        with pytest.raises(
+            TypeError,
+            match="Unable to put a value of type AzureBlobStore",
+        ):
+            data_item.put(123)
+
+    def test_large_upload(self):
+        # Time-consuming test, so every authentication method is checked in test_blob_upload, which is faster.
+
+        self.setup_before_test(
+            use_datastore_profile=False,
+            auth_method="env_conn_str",
+        )
+        data_item = mlrun.run.get_dataitem(self.object_url)
+        file_size = 1024 * 1024 * 100
+        chunk_size = 1024 * 1024 * 10
+
+        first_start_time = time.monotonic()
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".txt", delete=True, mode="wb"
+        ) as temp_file:
+            num_chunks = file_size // chunk_size
+            remainder = file_size % chunk_size
+            for _ in range(num_chunks):
+                chunk = os.urandom(chunk_size)
+                temp_file.write(chunk)
+            if remainder:
+                chunk = os.urandom(remainder)
+                temp_file.write(chunk)
+            temp_file.flush()
+            temp_file.seek(0)
+
+            logger.info(
+                f"azure test_large_upload - finished to write locally in {time.monotonic() - first_start_time} "
+                "seconds"
+            )
+            start_time = time.monotonic()
+            data_item.upload(temp_file.name)
+            logger.info(
+                f"azure test_large_upload - finished to upload in {time.monotonic() - start_time} seconds"
+            )
+            with tempfile.NamedTemporaryFile(
+                suffix=".txt", delete=True, mode="wb"
+            ) as temp_file_download:
+                start_time = time.monotonic()
+                data_item.download(temp_file_download.name)
+                logger.info(
+                    f"azure test_large_upload - finished to download in {time.monotonic() - start_time} seconds"
+                )
+                with (
+                    open(temp_file.name, "rb") as file1,
+                    open(temp_file_download.name, "rb") as file2,
+                ):
+                    chunk_number = 1
+                    while True:
+                        chunk1 = file1.read(chunk_size)
+                        chunk2 = file2.read(chunk_size)
+                        if not chunk1 and not chunk2:
+                            break
+                        if chunk1 != chunk2:
+                            raise AssertionError(
+                                f"expected chunk different from the result."
+                                f" Chunk number: {chunk_number}, chunk size: {chunk_size}"
+                            )
+                        chunk_number += 1
 
     @pytest.mark.parametrize(
         "auth_method ,use_datastore_profile", generated_pytest_parameters
@@ -358,7 +439,7 @@ class TestAzureBlob:
 
     @pytest.mark.parametrize("use_datastore_profile", [True, False])
     def test_empty_credential_rm(self, use_datastore_profile):
-        self.pop_env()
+        pop_env()
         self.build_object_url(use_datastore_profile)
         if use_datastore_profile:
             profile = DatastoreProfileAzureBlob(name=self.profile_name)
@@ -366,3 +447,34 @@ class TestAzureBlob:
         data_item = mlrun.run.get_dataitem(self.object_url)
         with pytest.raises(ValueError):
             data_item.delete()
+
+
+class TestAnonymousAccessAzureBlob:
+    account_name = "pandemicdatalake"
+
+    @pytest.fixture(autouse=True)
+    def setup_before_each_test(self):
+        pop_env()
+        store_manager.reset_secrets()
+        os.environ["AZURE_STORAGE_ACCOUNT_NAME"] = self.account_name
+
+    def teardown_class(self):
+        store_manager.reset_secrets()
+        pop_env()
+
+    def test_load_object_into_dask_dataframe(self):
+        # Load a parquet file from Azure Open Datasets
+
+        data_item = mlrun.datastore.store_manager.object(
+            "az://public/curated/covid-19/ecdc_cases/latest/ecdc_cases.parquet"
+        )
+        ddf = data_item.as_df(df_module=dd)
+        assert isinstance(ddf, dd.DataFrame)
+
+    def test_load_object_into_dask_dataframe_using_wasbs_url(self):
+        # Load a parquet file from Azure Open Datasets
+        data_item = mlrun.run.get_dataitem(
+            "wasbs://public@dummyaccount/curated/covid-19/ecdc_cases/latest/ecdc_cases.parquet"
+        )
+        ddf = data_item.as_df(df_module=dd)
+        assert isinstance(ddf, dd.DataFrame)

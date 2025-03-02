@@ -21,6 +21,7 @@ from .base import ObjectFormat
 
 
 class ArtifactFormat(ObjectFormat, mlrun.common.types.StrEnum):
+    full = "full"
     minimal = "minimal"
 
     @staticmethod
@@ -31,7 +32,7 @@ class ArtifactFormat(ObjectFormat, mlrun.common.types.StrEnum):
                 [
                     "kind",
                     "metadata",
-                    "status",
+                    "status.state",
                     "project",
                     "spec.producer",
                     "spec.db_key",

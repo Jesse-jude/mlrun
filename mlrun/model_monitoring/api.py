@@ -23,19 +23,28 @@ import pandas as pd
 import mlrun.artifacts
 import mlrun.common.helpers
 import mlrun.common.schemas.model_monitoring.constants as mm_constants
+import mlrun.datastore.base
 import mlrun.feature_store
-import mlrun.model_monitoring.application
 import mlrun.model_monitoring.applications as mm_app
 import mlrun.serving
+from mlrun.common.schemas import ModelEndpoint
+from mlrun.common.schemas.model_monitoring import (
+    FunctionURI,
+)
 from mlrun.data_types.infer import InferOptions, get_df_stats
 from mlrun.utils import datetime_now, logger
 
 from .helpers import update_model_endpoint_last_request
-from .model_endpoint import ModelEndpoint
 
 # A union of all supported dataset types:
 DatasetType = typing.Union[
-    mlrun.DataItem, list, dict, pd.DataFrame, pd.Series, np.ndarray, typing.Any
+    mlrun.datastore.base.DataItem,
+    list,
+    dict,
+    pd.DataFrame,
+    pd.Series,
+    np.ndarray,
+    typing.Any,
 ]
 
 
@@ -45,11 +54,10 @@ def get_or_create_model_endpoint(
     model_endpoint_name: str = "",
     endpoint_id: str = "",
     function_name: str = "",
-    context: mlrun.MLClientCtx = None,
-    sample_set_statistics: dict[str, typing.Any] = None,
-    drift_threshold: typing.Optional[float] = None,
-    possible_drift_threshold: typing.Optional[float] = None,
-    monitoring_mode: mm_constants.ModelMonitoringMode = mm_constants.ModelMonitoringMode.disabled,
+    function_tag: str = "latest",
+    context: typing.Optional["mlrun.MLClientCtx"] = None,
+    sample_set_statistics: typing.Optional[dict[str, typing.Any]] = None,
+    monitoring_mode: mm_constants.ModelMonitoringMode = mm_constants.ModelMonitoringMode.enabled,
     db_session=None,
 ) -> ModelEndpoint:
     """
@@ -63,16 +71,12 @@ def get_or_create_model_endpoint(
                                      under this endpoint (applicable only to new endpoint_id).
     :param endpoint_id:              Model endpoint unique ID. If not exist in DB, will generate a new record based
                                      on the provided `endpoint_id`.
-    :param function_name:            If a new model endpoint is created, use this function name for generating the
-                                     function URI (applicable only to new endpoint_id).
+    :param function_name:            If a new model endpoint is created, use this function name.
+    :param function_tag:             If a new model endpoint is created, use this function tag.
     :param context:                  MLRun context. If `function_name` not provided, use the context to generate the
                                      full function hash.
     :param sample_set_statistics:    Dictionary of sample set statistics that will be used as a reference data for
                                      the new model endpoint (applicable only to new endpoint_id).
-    :param drift_threshold:          (deprecated) The threshold of which to mark drifts (applicable only to new
-                                     endpoint_id).
-    :param possible_drift_threshold: (deprecated) The threshold of which to mark possible drifts (applicable only to new
-                                     endpoint_id).
     :param monitoring_mode:          If enabled, apply model monitoring features on the provided endpoint id
                                      (applicable only to new endpoint_id).
     :param db_session:               A runtime session that manages the current dialog with the database.
@@ -80,18 +84,21 @@ def get_or_create_model_endpoint(
     :return: A ModelEndpoint object
     """
 
-    if not endpoint_id:
-        # Generate a new model endpoint id based on the project name and model name
-        endpoint_id = hashlib.sha1(
-            f"{project}_{model_endpoint_name}".encode()
-        ).hexdigest()
-
     if not db_session:
         # Generate a runtime database
         db_session = mlrun.get_run_db()
+    model_endpoint = None
+    if not function_name and context:
+        function_name = FunctionURI.from_string(
+            context.to_dict()["spec"]["function"]
+        ).function
     try:
         model_endpoint = db_session.get_model_endpoint(
-            project=project, endpoint_id=endpoint_id
+            project=project,
+            name=model_endpoint_name,
+            endpoint_id=endpoint_id,
+            function_name=function_name,
+            function_tag=function_tag or "latest",
         )
         # If other fields provided, validate that they are correspond to the existing model endpoint data
         _model_endpoint_validations(
@@ -100,15 +107,17 @@ def get_or_create_model_endpoint(
             sample_set_statistics=sample_set_statistics,
         )
 
-    except mlrun.errors.MLRunNotFoundError:
+    except (mlrun.errors.MLRunNotFoundError, mlrun.errors.MLRunInvalidArgumentError):
         # Create a new model endpoint with the provided details
+        pass
+    if not model_endpoint:
         model_endpoint = _generate_model_endpoint(
             project=project,
             db_session=db_session,
-            endpoint_id=endpoint_id,
             model_path=model_path,
             model_endpoint_name=model_endpoint_name,
             function_name=function_name,
+            function_tag=function_tag,
             context=context,
             sample_set_statistics=sample_set_statistics,
             monitoring_mode=monitoring_mode,
@@ -122,7 +131,7 @@ def record_results(
     model_endpoint_name: str,
     endpoint_id: str = "",
     function_name: str = "",
-    context: typing.Optional[mlrun.MLClientCtx] = None,
+    context: typing.Optional["mlrun.MLClientCtx"] = None,
     infer_results_df: typing.Optional[pd.DataFrame] = None,
     sample_set_statistics: typing.Optional[dict[str, typing.Any]] = None,
     monitoring_mode: mm_constants.ModelMonitoringMode = mm_constants.ModelMonitoringMode.enabled,
@@ -147,8 +156,7 @@ def record_results(
                                      on the provided `endpoint_id`.
     :param function_name:            If a new model endpoint is created, use this function name for generating the
                                      function URI.
-    :param context:                  MLRun context. Note that the context is required for logging the artifacts
-                                     following the batch drift job.
+    :param context:                  MLRun context. Note that the context is required generating the model endpoint.
     :param infer_results_df:         DataFrame that will be stored under the model endpoint parquet target. Will be
                                      used for doing the drift analysis. Please make sure that the dataframe includes
                                      both feature names and label columns.
@@ -210,13 +218,13 @@ def record_results(
         monitoring_mode=monitoring_mode,
         db_session=db,
     )
-    logger.debug("Model endpoint", endpoint=model_endpoint.to_dict())
+    logger.debug("Model endpoint", endpoint=model_endpoint)
 
     timestamp = datetime_now()
     if infer_results_df is not None:
         # Write the monitoring parquet to the relevant model endpoint context
         write_monitoring_df(
-            feature_set_uri=model_endpoint.status.monitoring_feature_set_uri,
+            feature_set_uri=model_endpoint.spec.monitoring_feature_set_uri,
             infer_datetime=timestamp,
             endpoint_id=model_endpoint.metadata.uid,
             infer_results_df=infer_results_df,
@@ -236,7 +244,7 @@ def record_results(
 def _model_endpoint_validations(
     model_endpoint: ModelEndpoint,
     model_path: str = "",
-    sample_set_statistics: dict[str, typing.Any] = None,
+    sample_set_statistics: typing.Optional[dict[str, typing.Any]] = None,
 ) -> None:
     """
     Validate that provided model endpoint configurations match the stored fields of the provided `ModelEndpoint`
@@ -252,18 +260,35 @@ def _model_endpoint_validations(
                                      In case of discrepancy between the provided `sample_set_statistics` and the
                                      `model_endpoints.spec.feature_stats`, a warning will be presented to the user.
     """
-    # Model path
-    if model_path and model_endpoint.spec.model_uri != model_path:
-        raise mlrun.errors.MLRunInvalidArgumentError(
-            f"provided model store path {model_path} does not match "
-            f"the path that is stored under the existing model "
-            f"endpoint record: {model_endpoint.spec.model_uri}"
+
+    # Model Path
+    if model_path:
+        # Generate the parsed model uri that is based on hash, key, iter, and tree
+        model_obj = mlrun.datastore.get_store_resource(model_path)
+
+        model_artifact_uri = mlrun.utils.helpers.generate_artifact_uri(
+            project=model_endpoint.metadata.project,
+            key=model_obj.key,
+            iter=model_obj.iter,
+            tree=model_obj.tree,
         )
+
+        # Enrich the uri schema with the store prefix
+        model_artifact_uri = mlrun.datastore.get_store_uri(
+            kind=mlrun.utils.helpers.StorePrefix.Model, uri=model_artifact_uri
+        )
+
+        if model_endpoint.spec.model_uri != model_artifact_uri:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"provided model store path {model_path} does not match "
+                f"the path that is stored under the existing model "
+                f"endpoint record: {model_endpoint.spec.model_uri}"
+            )
 
     # Feature stats
     if (
         sample_set_statistics
-        and sample_set_statistics != model_endpoint.status.feature_stats
+        and sample_set_statistics != model_endpoint.spec.feature_stats
     ):
         logger.warning(
             "Provided sample set statistics is different from the registered statistics. "
@@ -275,7 +300,7 @@ def write_monitoring_df(
     endpoint_id: str,
     infer_results_df: pd.DataFrame,
     infer_datetime: datetime,
-    monitoring_feature_set: typing.Optional[mlrun.feature_store.FeatureSet] = None,
+    monitoring_feature_set: typing.Optional["mlrun.feature_store.FeatureSet"] = None,
     feature_set_uri: str = "",
 ) -> None:
     """Write infer results dataframe to the monitoring parquet target of the current model endpoint. The dataframe will
@@ -315,13 +340,13 @@ def write_monitoring_df(
 def _generate_model_endpoint(
     project: str,
     db_session,
-    endpoint_id: str,
     model_path: str,
     model_endpoint_name: str,
     function_name: str,
-    context: mlrun.MLClientCtx,
+    function_tag: str,
+    context: "mlrun.MLClientCtx",
     sample_set_statistics: dict[str, typing.Any],
-    monitoring_mode: mm_constants.ModelMonitoringMode = mm_constants.ModelMonitoringMode.disabled,
+    monitoring_mode: mm_constants.ModelMonitoringMode = mm_constants.ModelMonitoringMode.enabled,
 ) -> ModelEndpoint:
     """
     Write a new model endpoint record.
@@ -329,50 +354,54 @@ def _generate_model_endpoint(
     :param project:                  Project name.
 
     :param db_session:               A session that manages the current dialog with the database.
-    :param endpoint_id:              Model endpoint unique ID.
     :param model_path:               The model Store path.
     :param model_endpoint_name:      Model endpoint name will be presented under the new model endpoint.
-    :param function_name:            If a new model endpoint is created, use this function name for generating the
-                                     function URI.
+    :param function_name:            If a new model endpoint is created, use this function name.
+    :param function_tag:             If a new model endpoint is created, use this function tag.
     :param context:                  MLRun context. If function_name not provided, use the context to generate the
                                      full function hash.
     :param sample_set_statistics:    Dictionary of sample set statistics that will be used as a reference data for
                                      the current model endpoint. Will be stored under
                                      `model_endpoint.status.feature_stats`.
 
-    :return `mlrun.model_monitoring.model_endpoint.ModelEndpoint` object.
+    :return `mlrun.common.schemas.ModelEndpoint` object.
     """
-    model_endpoint = ModelEndpoint()
-    model_endpoint.metadata.project = project
-    model_endpoint.metadata.uid = endpoint_id
-    if function_name:
-        model_endpoint.spec.function_uri = project + "/" + function_name
-    elif not context:
-        raise mlrun.errors.MLRunInvalidArgumentError(
-            "Please provide either a function name or a valid MLRun context"
+    model_obj = None
+    if model_path:
+        model_obj: mlrun.artifacts.ModelArtifact = (
+            mlrun.datastore.store_resources.get_store_resource(
+                model_path, db=db_session
+            )
         )
-    else:
-        model_endpoint.spec.function_uri = context.to_dict()["spec"]["function"]
-    model_endpoint.spec.model_uri = model_path
-    model_endpoint.spec.model = model_endpoint_name
-    model_endpoint.spec.model_class = "drift-analysis"
-    model_endpoint.spec.monitoring_mode = monitoring_mode
-    model_endpoint.status.first_request = model_endpoint.status.last_request = (
-        datetime_now().isoformat()
+    current_time = datetime_now()
+    model_endpoint = mlrun.common.schemas.ModelEndpoint(
+        metadata=mlrun.common.schemas.ModelEndpointMetadata(
+            project=project,
+            name=model_endpoint_name,
+            endpoint_type=mlrun.common.schemas.model_monitoring.EndpointType.BATCH_EP,
+        ),
+        spec=mlrun.common.schemas.ModelEndpointSpec(
+            function_name=function_name or "function",
+            function_tag=function_tag or "latest",
+            model_name=model_obj.metadata.key if model_obj else None,
+            model_uid=model_obj.metadata.uid if model_obj else None,
+            model_tag=model_obj.metadata.tag if model_obj else None,
+            model_db_key=model_obj.spec.db_key if model_obj else None,
+            model_class="drift-analysis",
+        ),
+        status=mlrun.common.schemas.ModelEndpointStatus(
+            monitoring_mode=monitoring_mode,
+            first_request=current_time,
+            last_request=current_time,
+        ),
     )
-    if sample_set_statistics:
-        model_endpoint.status.feature_stats = sample_set_statistics
 
-    db_session.create_model_endpoint(
-        project=project, endpoint_id=endpoint_id, model_endpoint=model_endpoint
-    )
-
-    return db_session.get_model_endpoint(project=project, endpoint_id=endpoint_id)
+    return db_session.create_model_endpoint(model_endpoint=model_endpoint)
 
 
 def get_sample_set_statistics(
     sample_set: DatasetType = None,
-    model_artifact_feature_stats: dict = None,
+    model_artifact_feature_stats: typing.Optional[dict] = None,
     sample_set_columns: typing.Optional[list] = None,
     sample_set_drop_columns: typing.Optional[list] = None,
     sample_set_label_columns: typing.Optional[list] = None,
@@ -430,9 +459,9 @@ def get_sample_set_statistics(
 
 def read_dataset_as_dataframe(
     dataset: DatasetType,
-    feature_columns: typing.Union[str, list[str]] = None,
-    label_columns: typing.Union[str, list[str]] = None,
-    drop_columns: typing.Union[str, list[str], int, list[int]] = None,
+    feature_columns: typing.Optional[typing.Union[str, list[str]]] = None,
+    label_columns: typing.Optional[typing.Union[str, list[str]]] = None,
+    drop_columns: typing.Optional[typing.Union[str, list[str], int, list[int]]] = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Parse the given dataset into a DataFrame and drop the columns accordingly. In addition, the label columns will be
@@ -516,7 +545,7 @@ def read_dataset_as_dataframe(
 
 
 def log_result(
-    context: mlrun.MLClientCtx,
+    context: "mlrun.MLClientCtx",
     result_set_name: str,
     result_set: pd.DataFrame,
     artifacts_tag: str,
@@ -544,10 +573,7 @@ def _create_model_monitoring_function_base(
     project: str,
     func: typing.Union[str, None] = None,
     application_class: typing.Union[
-        str,
-        mlrun.model_monitoring.application.ModelMonitoringApplicationBase,
-        mm_app.ModelMonitoringApplicationBaseV2,
-        None,
+        str, "mm_app.ModelMonitoringApplicationBase", None
     ] = None,
     name: typing.Optional[str] = None,
     image: typing.Optional[str] = None,
@@ -560,15 +586,6 @@ def _create_model_monitoring_function_base(
     Note: this is an internal API only.
     This function does not set the labels or mounts v3io.
     """
-    if isinstance(
-        application_class,
-        mlrun.model_monitoring.application.ModelMonitoringApplicationBase,
-    ):
-        warnings.warn(
-            "The `ModelMonitoringApplicationBase` class is deprecated from version 1.7.0, "
-            "please use `ModelMonitoringApplicationBaseV2`. It will be removed in 1.9.0.",
-            FutureWarning,
-        )
     if name in mm_constants._RESERVED_FUNCTION_NAMES:
         raise mlrun.errors.MLRunInvalidArgumentError(
             "An application cannot have the following names: "
@@ -599,11 +616,28 @@ def _create_model_monitoring_function_base(
         app_step = prepare_step.to(class_name=application_class, **application_kwargs)
     else:
         app_step = prepare_step.to(class_name=application_class)
+
     app_step.__class__ = mlrun.serving.MonitoringApplicationStep
+
+    app_step.error_handler(
+        class_name="mlrun.model_monitoring.applications._application_steps._ApplicationErrorHandler",
+        name="ApplicationErrorHandler",
+        full_event=True,
+        project=project,
+    )
+
     app_step.to(
         class_name="mlrun.model_monitoring.applications._application_steps._PushToMonitoringWriter",
         name="PushToMonitoringWriter",
         project=project,
-        writer_application_name=mm_constants.MonitoringFunctionNames.WRITER,
-    ).respond()
+    )
+
+    def block_to_mock_server(*args, **kwargs) -> typing.NoReturn:
+        raise NotImplementedError(
+            "Model monitoring serving functions do not support `.to_mock_server`. "
+            "You may call your model monitoring application object logic via the `.evaluate` method."
+        )
+
+    func_obj.to_mock_server = block_to_mock_server  # Until ML-7643 is implemented
+
     return func_obj

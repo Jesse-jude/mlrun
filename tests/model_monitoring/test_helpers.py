@@ -14,37 +14,49 @@
 
 import datetime
 from collections.abc import Iterator
-from typing import NamedTuple, Optional
-from unittest.mock import Mock, patch
+from typing import NamedTuple, Optional, Union
+from unittest.mock import patch
 
 import nuclio
+import numpy as np
+import pandas as pd
 import pytest
-from v3io.dataplane.response import HttpResponseError
 
 import mlrun
 from mlrun.common.model_monitoring.helpers import (
     _MAX_FLOAT,
     FeatureStats,
     Histogram,
+    get_kafka_topic,
     pad_features_hist,
     pad_hist,
 )
+from mlrun.common.schemas import EndpointType, ModelEndpoint
 from mlrun.common.schemas.model_monitoring.constants import EventFieldType
+from mlrun.datastore import KafkaOutputStream, OutputStream
+from mlrun.datastore.datastore_profile import (
+    DatastoreProfile,
+    DatastoreProfileKafkaSource,
+    DatastoreProfileKafkaTarget,
+    DatastoreProfileV3io,
+)
 from mlrun.db.nopdb import NopDB
 from mlrun.model_monitoring.controller import (
     _BatchWindow,
     _BatchWindowGenerator,
     _Interval,
 )
+from mlrun.model_monitoring.db._schedules import ModelMonitoringSchedulesFile
 from mlrun.model_monitoring.helpers import (
+    _BatchDict,
     _get_monitoring_time_window_from_controller_run,
+    batch_dict2timedelta,
+    filter_results_by_regex,
     get_invocations_fqn,
+    get_output_stream,
     update_model_endpoint_last_request,
 )
-from mlrun.model_monitoring.model_endpoint import ModelEndpoint
 from mlrun.utils import datetime_now
-
-TEST_PROJECT = "my-project"
 
 
 class _HistLen(NamedTuple):
@@ -130,14 +142,60 @@ def test_pad_features_hist(
         _check_padded_hist_spec(feat["hist"], orig_feature_stats_hist_data[feat_name])
 
 
-class TestBatchInterval:
-    @staticmethod
-    @pytest.fixture(autouse=True)
-    def set_mlconf():
-        mlrun.mlconf.model_endpoint_monitoring.endpoint_store_connection = "v3io"
-        mlrun.mlconf.model_endpoint_monitoring.tsdb_connection = "v3io"
-        yield
+def generate_sample_data(
+    feature_stats: FeatureStats,
+    num_samples: int = 50,
+) -> pd.DataFrame:
+    data = {}
+    for feature in feature_stats.keys():
+        data[feature] = []
+        for sample in range(num_samples):
+            loc = np.random.uniform(
+                low=feature_stats[feature]["hist"][1][0],
+                high=feature_stats[feature]["hist"][1][-1],
+            )
+            feature_data = np.random.normal(loc=loc, scale=1.5, size=1)
+            data[feature].append(float(feature_data))
+    return pd.DataFrame(data)
 
+
+def test_calculate_input_statistics(
+    feature_stats: FeatureStats,
+) -> None:
+    """In the following test we will generate a sample data and calculate the input statistics based on the feature
+    statistics. In addition, we will add a string feature to the sample data and check that it was removed from the
+    input statistics."""
+
+    input_data = generate_sample_data(feature_stats)
+
+    # add string feature to input data
+    input_data["str_feat"] = "blabla"
+    current_stats = mlrun.model_monitoring.helpers.calculate_inputs_statistics(
+        sample_set_statistics=feature_stats,
+        inputs=input_data,
+    )
+    # check that the string feature was removed
+    assert "str_feat" not in current_stats.keys()
+
+    # check that the current_stats have the same keys as the feature_stats
+    assert current_stats.keys() == feature_stats.keys()
+
+    # validate the expected keys in a certain feature statistics
+    feature_statistics = current_stats[next(iter(feature_stats))]
+    assert list(feature_statistics.keys()) == [
+        "count",
+        "mean",
+        "std",
+        "min",
+        "25%",
+        "50%",
+        "75%",
+        "max",
+        "hist",
+    ]
+
+
+class TestBatchInterval:
     @staticmethod
     @pytest.fixture
     def timedelta_seconds(request: pytest.FixtureRequest) -> int:
@@ -175,38 +233,39 @@ class TestBatchInterval:
 
     @staticmethod
     @pytest.fixture(autouse=True)
-    def mock_kv() -> Iterator[None]:
-        mock = Mock(spec=["kv"])
-        mock.kv.get = Mock(side_effect=HttpResponseError)
-        with patch(
-            "mlrun.utils.v3io_clients.get_v3io_client",
-            return_value=mock,
-        ):
-            with patch(
-                "mlrun.model_monitoring.get_store_object",
-                return_value=mlrun.model_monitoring.get_store_object(
-                    store_connection_string="v3io", project=TEST_PROJECT
-                ),
-            ):
-                yield
+    def _patch_store_prefixes(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "MLRUN_MODEL_ENDPOINT_MONITORING__STORE_PREFIXES__DEFAULT",
+            "memory://users/pipelines/{{project}}/model-endpoints/{{kind}}",
+        )
+        mlrun.mlconf.reload()
+
+    @staticmethod
+    @pytest.fixture
+    def schedules_file() -> Iterator[ModelMonitoringSchedulesFile]:
+        file = ModelMonitoringSchedulesFile(project="test-intervals", endpoint_id="ep")
+        file.create()
+        yield file
+        file.delete()
 
     @staticmethod
     @pytest.fixture
     def intervals(
+        schedules_file: ModelMonitoringSchedulesFile,
         timedelta_seconds: int,
         first_request: int,
         last_updated: int,
     ) -> list[_Interval]:
-        return list(
-            _BatchWindow(
-                project="project",
-                endpoint="ep",
-                application="app",
-                timedelta_seconds=timedelta_seconds,
-                first_request=first_request,
-                last_updated=last_updated,
-            ).get_intervals()
-        )
+        with schedules_file as f:
+            return list(
+                _BatchWindow(
+                    schedules_file=f,
+                    application="app",
+                    timedelta_seconds=timedelta_seconds,
+                    first_request=first_request,
+                    last_updated=last_updated,
+                ).get_intervals()
+            )
 
     @staticmethod
     @pytest.fixture
@@ -267,26 +326,26 @@ class TestBatchInterval:
             (60, 100, 300, 100),
             (60, 100, 110, 100),
             (60, 0, 0, 0),
-            (60, None, None, None),
         ],
     )
     def test_get_last_analyzed(
         timedelta_seconds: int,
-        last_updated: Optional[int],
-        first_request: Optional[int],
-        expected_last_analyzed: Optional[int],
+        last_updated: int,
+        first_request: int,
+        expected_last_analyzed: int,
+        schedules_file: ModelMonitoringSchedulesFile,
     ) -> None:
-        assert (
-            _BatchWindow(
-                project=TEST_PROJECT,
-                endpoint="some-endpoint",
-                application="special-app",
-                timedelta_seconds=timedelta_seconds,
-                first_request=first_request,
-                last_updated=last_updated,
-            )._get_last_analyzed()
-            == expected_last_analyzed
-        ), "The last analyzed time is not as expected"
+        with schedules_file as f:
+            assert (
+                _BatchWindow(
+                    schedules_file=f,
+                    application="special-app",
+                    timedelta_seconds=timedelta_seconds,
+                    first_request=first_request,
+                    last_updated=last_updated,
+                )._get_last_analyzed()
+                == expected_last_analyzed
+            ), "The last analyzed time is not as expected"
 
     @staticmethod
     @pytest.mark.timedelta_seconds(int(datetime.timedelta(days=6).total_seconds()))
@@ -317,25 +376,10 @@ class TestBatchInterval:
 
 class TestBatchWindowGenerator:
     @staticmethod
-    @pytest.mark.parametrize(
-        ("first_request", "expected"),
-        [("", None), (None, None), ("2023-11-09 09:25:59.554971+00:00", 1699521959)],
-    )
-    def test_normalize_first_request(
-        first_request: Optional[str], expected: Optional[int]
-    ) -> None:
-        assert (
-            _BatchWindowGenerator._normalize_first_request(
-                first_request=first_request, endpoint=""
-            )
-            == expected
-        )
-
-    @staticmethod
     def test_last_updated_is_in_the_past() -> None:
         last_request = datetime.datetime(2023, 11, 16, 12, 0, 0)
         last_updated = _BatchWindowGenerator._get_last_updated_time(
-            last_request=last_request.isoformat(), has_stream=True
+            last_request=last_request, not_batch_endpoint=True
         )
         assert last_updated
         assert (
@@ -357,7 +401,13 @@ class TestBumpModelEndpointLastRequest:
     @staticmethod
     @pytest.fixture
     def empty_model_endpoint() -> ModelEndpoint:
-        return ModelEndpoint()
+        return ModelEndpoint(
+            metadata=mlrun.common.schemas.ModelEndpointMetadata(
+                name="test", project="test-project"
+            ),
+            spec=mlrun.common.schemas.ModelEndpointSpec(),
+            status=mlrun.common.schemas.ModelEndpointStatus(),
+        )
 
     @staticmethod
     @pytest.fixture
@@ -385,7 +435,6 @@ class TestBumpModelEndpointLastRequest:
         last_request: str,
         function: mlrun.runtimes.ServingRuntime,
     ) -> None:
-        model_endpoint.spec.stream_path = "stream"
         with patch.object(db, "patch_model_endpoint") as patch_patch_model_endpoint:
             with patch.object(db, "get_function", return_value=function):
                 update_model_endpoint_last_request(
@@ -395,12 +444,10 @@ class TestBumpModelEndpointLastRequest:
                     db=db,
                 )
         patch_patch_model_endpoint.assert_called_once()
-        assert datetime.datetime.fromisoformat(
-            patch_patch_model_endpoint.call_args.kwargs["attributes"][
-                EventFieldType.LAST_REQUEST
-            ]
-        ) == datetime.datetime.fromisoformat(last_request)
-        model_endpoint.spec.stream_path = ""
+        assert patch_patch_model_endpoint.call_args.kwargs["attributes"][
+            EventFieldType.LAST_REQUEST
+        ] == datetime.datetime.fromisoformat(last_request)
+        model_endpoint.metadata.endpoint_type = EndpointType.BATCH_EP
 
         with patch.object(db, "patch_model_endpoint") as patch_patch_model_endpoint:
             with patch.object(db, "get_function", return_value=function):
@@ -411,11 +458,9 @@ class TestBumpModelEndpointLastRequest:
                     db=db,
                 )
         patch_patch_model_endpoint.assert_called_once()
-        assert datetime.datetime.fromisoformat(
-            patch_patch_model_endpoint.call_args.kwargs["attributes"][
-                EventFieldType.LAST_REQUEST
-            ]
-        ) == datetime.datetime.fromisoformat(last_request) + datetime.timedelta(
+        assert patch_patch_model_endpoint.call_args.kwargs["attributes"][
+            EventFieldType.LAST_REQUEST
+        ] == datetime.datetime.fromisoformat(last_request) + datetime.timedelta(
             minutes=1
         ) + datetime.timedelta(
             seconds=mlrun.mlconf.model_endpoint_monitoring.parquet_batching_timeout_secs
@@ -431,6 +476,7 @@ class TestBumpModelEndpointLastRequest:
             with patch.object(
                 db, "get_function", side_effect=mlrun.errors.MLRunNotFoundError
             ):
+                model_endpoint.metadata.endpoint_type = EndpointType.BATCH_EP
                 update_model_endpoint_last_request(
                     project=project,
                     model_endpoint=model_endpoint,
@@ -454,3 +500,132 @@ class TestBumpModelEndpointLastRequest:
 
 def test_get_invocations_fqn() -> None:
     assert get_invocations_fqn("project") == "project.mlrun-infra.metric.invocations"
+
+
+def test_batch_dict2timedelta() -> None:
+    assert batch_dict2timedelta(
+        _BatchDict(minutes=32, hours=0, days=4)
+    ) == datetime.timedelta(minutes=32, days=4), "Different timedelta than expected"
+
+
+def test_filter_results_by_regex():
+    existing_result_names = [
+        "mep1.app1.result.metric1",
+        "mep1.app1.result.metric2",
+        "mep1.app2.result.metric1",
+        "mep1.app2.result.metric2",
+        "mep1.app2.result.metric3",
+        "mep1.app2.result.result-a",
+        "mep1.app2.result.result-b",
+        "mep1.app3.result.result1",
+        "mep1.app3.result.result2",
+        "mep1.app4.result.result1",
+        "mep1.app4.result.result2",
+    ]
+
+    expected_result_names = [
+        "mep1.app1.result.metric1",
+        "mep1.app2.result.metric1",
+        "mep1.app2.result.result-a",
+        "mep1.app2.result.result-b",
+        "mep1.app3.result.result1",
+        "mep1.app3.result.result2",
+        "mep1.app4.result.result1",
+    ]
+
+    results_names_filters = [
+        "*.metric1",
+        "app2.result-*",
+        "app3.*",
+        "app4.result1",
+    ]
+    filtered_results = filter_results_by_regex(
+        existing_result_names=existing_result_names,
+        result_name_filters=results_names_filters,
+    )
+    assert sorted(filtered_results) == sorted(expected_result_names)
+
+
+@pytest.mark.parametrize(
+    ("project", "function_name", "expected_topic"),
+    [
+        ("p1", None, "monitoring_stream__p1_v1"),
+        ("mm", "model-monitoring-stream", "monitoring_stream__mm_v1"),
+        (
+            "mm",
+            "model-monitoring-controller",
+            "monitoring_stream__mm_model-monitoring-controller_v1",
+        ),
+        ("mm", "model-monitoring-stream", "monitoring_stream__mm_v1"),
+        (
+            "special-mm-12",
+            "model-monitoring-writer",
+            "monitoring_stream__special-mm-12_model-monitoring-writer_v1",
+        ),
+    ],
+)
+def test_get_kafka_topic(
+    project: str,
+    function_name: Optional[str],
+    expected_topic: str,
+) -> None:
+    assert (
+        get_kafka_topic(project=project, function_name=function_name) == expected_topic
+    ), "The topic is different than expected"
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_output_stream_type"),
+    [
+        (
+            DatastoreProfileKafkaSource(
+                name="test-kafka-profile",
+                brokers=["localhost"],
+                topics=[],
+                sasl_user="user1",
+                sasl_pass="1234",
+                kwargs_public={"api_version": (3, 9)},
+            ),
+            KafkaOutputStream,
+        ),
+        (
+            DatastoreProfileV3io(
+                name="test-v3io-profile", v3io_access_key="valid-access-key"
+            ),
+            OutputStream,
+        ),
+    ],
+)
+def test_get_output_stream(
+    profile: DatastoreProfile,
+    expected_output_stream_type: Union[type[KafkaOutputStream], type[OutputStream]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if isinstance(profile, DatastoreProfileV3io):
+        monkeypatch.setenv("V3IO_API", mlrun.mlconf.v3io_api)
+
+    output_stream = get_output_stream(profile=profile, project="test-proj", mock=True)
+    assert isinstance(
+        output_stream, expected_output_stream_type
+    ), "The output stream is of an unexpected type"
+
+    output_stream.push(2 * [{"k1": 0, "jump": "high"}])
+    output_stream.push([{"k1": 1, "jump": "mid"}])
+
+
+def test_get_output_stream_unsupported() -> None:
+    with pytest.raises(
+        mlrun.errors.MLRunValueError,
+        match=(
+            r".*an unexpected stream profile type: "
+            r"<class 'mlrun\.datastore\.datastore_profile\.DatastoreProfileKafkaTarget'>"
+            r".*"
+        ),
+    ):
+        get_output_stream(
+            project="nmo",
+            function_name="model-monitoring-controller",
+            profile=DatastoreProfileKafkaTarget(
+                name="k-tgt", brokers="localhost", topic="t1"
+            ),
+        )

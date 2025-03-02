@@ -16,6 +16,7 @@ import logging
 import re
 import subprocess
 import tempfile
+from typing import Optional
 
 import click
 import requests
@@ -29,7 +30,7 @@ class ReleaseNotesGenerator:
         r"^"
         r"(?P<commitId>[a-zA-Z0-9]+)"
         r" {"
-        r"(?P<username>[a-zA-Z0-9-_\s]+)"
+        r"(?P<username>[a-zA-Z0-9-_\s\[\]]+)"
         r"} "
         r"(\[(?P<scope>[^\]]*)\])?"
         r"( )?"
@@ -48,7 +49,7 @@ class ReleaseNotesGenerator:
         previous_release: str,
         release_branch: str,
         raise_on_failed_parsing: bool = True,
-        tmp_file_path: str = None,
+        tmp_file_path: Optional[str] = None,
         skip_clone: bool = False,
     ):
         self._logger = logger

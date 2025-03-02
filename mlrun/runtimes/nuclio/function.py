@@ -23,11 +23,9 @@ import inflection
 import nuclio
 import nuclio.utils
 import requests
+import semver
 from aiohttp.client import ClientSession
 from kubernetes import client
-from mlrun_pipelines.common.mounts import VolumeMount
-from mlrun_pipelines.common.ops import deploy_op
-from mlrun_pipelines.mounts import mount_v3io, v3io_cred
 from nuclio.deploy import find_dashboard_url, get_deploy_status
 from nuclio.triggers import V3IOStreamTrigger
 
@@ -46,9 +44,11 @@ from mlrun.platforms.iguazio import (
     split_path,
 )
 from mlrun.runtimes.base import FunctionStatus, RunError
+from mlrun.runtimes.mounts import VolumeMount, mount_v3io, v3io_cred
 from mlrun.runtimes.pod import KubeResource, KubeResourceSpec
 from mlrun.runtimes.utils import get_item_name, log_std
 from mlrun.utils import get_in, logger, update_in
+from mlrun_pipelines.common.ops import deploy_op
 
 
 def validate_nuclio_version_compatibility(*min_versions):
@@ -296,9 +296,36 @@ class RemoteRuntime(KubeResource):
         """
         if hasattr(spec, "to_dict"):
             spec = spec.to_dict()
+
+        self._validate_triggers(spec)
+
         spec["name"] = name
         self.spec.config[f"spec.triggers.{name}"] = spec
         return self
+
+    def _validate_triggers(self, spec):
+        # ML-7763 / NUC-233
+        min_nuclio_version = "1.13.12"
+        if mlconf.nuclio_version and semver.VersionInfo.parse(
+            mlconf.nuclio_version
+        ) < semver.VersionInfo.parse(min_nuclio_version):
+            explicit_ack_enabled = False
+            num_triggers = 0
+            trigger_name = spec.get("name", "UNKNOWN")
+            for key, config in [(f"spec.triggers.{trigger_name}", spec)] + list(
+                self.spec.config.items()
+            ):
+                if key.startswith("spec.triggers."):
+                    num_triggers += 1
+                    explicit_ack_enabled = (
+                        config.get("explicitAckMode", "disable") != "disable"
+                    )
+
+            if num_triggers > 1 and explicit_ack_enabled:
+                raise mlrun.errors.MLRunInvalidArgumentError(
+                    "Multiple triggers cannot be used in conjunction with explicit ack. "
+                    f"Please upgrade to nuclio {min_nuclio_version} or newer."
+                )
 
     def with_source_archive(
         self,
@@ -342,8 +369,9 @@ class RemoteRuntime(KubeResource):
                 )
         """
         self.spec.build.source = source
-        # update handler in function_handler
-        self.spec.function_handler = handler
+        # update handler in function_handler if needed
+        if handler:
+            self.spec.function_handler = handler
         if workdir:
             self.spec.workdir = workdir
         if runtime:
@@ -418,14 +446,8 @@ class RemoteRuntime(KubeResource):
                 raise ValueError(
                     "gateway timeout must be greater than the worker timeout"
                 )
-            annotations["nginx.ingress.kubernetes.io/proxy-connect-timeout"] = (
-                f"{gateway_timeout}"
-            )
-            annotations["nginx.ingress.kubernetes.io/proxy-read-timeout"] = (
-                f"{gateway_timeout}"
-            )
-            annotations["nginx.ingress.kubernetes.io/proxy-send-timeout"] = (
-                f"{gateway_timeout}"
+            mlrun.runtimes.utils.enrich_gateway_timeout_annotations(
+                annotations, gateway_timeout
             )
 
         trigger = nuclio.HttpTrigger(
@@ -446,6 +468,11 @@ class RemoteRuntime(KubeResource):
         return self
 
     def from_image(self, image):
+        """
+        Deploy the function with an existing nuclio processor image.
+
+        :param image: image name
+        """
         config = nuclio.config.new_config()
         update_in(
             config,
@@ -496,6 +523,22 @@ class RemoteRuntime(KubeResource):
         extra_attributes = extra_attributes or {}
         if ack_window_size:
             extra_attributes["ackWindowSize"] = ack_window_size
+
+        access_key = kwargs.pop("access_key", None)
+        if not access_key:
+            access_key = self._resolve_v3io_access_key()
+        engine = "sync"
+        explicit_ack_mode = kwargs.pop("explicit_ack_mode", None)
+        if (
+            self.spec
+            and hasattr(self.spec, "graph")
+            and self.spec.graph
+            and self.spec.graph.engine
+        ):
+            engine = self.spec.graph.engine
+        if mlrun.mlconf.is_explicit_ack_enabled() and engine == "async":
+            explicit_ack_mode = explicit_ack_mode or "explicitOnly"
+
         self.add_trigger(
             name,
             V3IOStreamTrigger(
@@ -507,6 +550,8 @@ class RemoteRuntime(KubeResource):
                 webapi=endpoint or "http://v3io-webapi:8081",
                 extra_attributes=extra_attributes,
                 read_batch_size=256,
+                access_key=access_key,
+                explicit_ack_mode=explicit_ack_mode,
                 **kwargs,
             ),
         )
@@ -521,7 +566,7 @@ class RemoteRuntime(KubeResource):
         tag="",
         verbose=False,
         auth_info: AuthInfo = None,
-        builder_env: dict = None,
+        builder_env: typing.Optional[dict] = None,
         force_build: bool = False,
     ):
         """Deploy the nuclio function to the cluster
@@ -567,6 +612,18 @@ class RemoteRuntime(KubeResource):
         # when a function is deployed, we wait for it to be ready by default
         # this also means that the function object will be updated with the function status
         self._wait_for_function_deployment(db, verbose=verbose)
+        # check if there are any background tasks related to creating model endpoints
+        model_endpoints_creation_background_tasks = (
+            mlrun.common.schemas.BackgroundTaskList(
+                **data.pop("background_tasks", {"background_tasks": []})
+            ).background_tasks
+        )
+        if model_endpoints_creation_background_tasks:
+            self._check_model_endpoint_task_state(
+                db=db,
+                background_task=model_endpoints_creation_background_tasks[0],
+                wait_for_completion=False,
+            )
 
         return self._enrich_command_from_status()
 
@@ -660,7 +717,9 @@ class RemoteRuntime(KubeResource):
         super().with_priority_class(name)
 
     def with_service_type(
-        self, service_type: str, add_templated_ingress_host_mode: str = None
+        self,
+        service_type: str,
+        add_templated_ingress_host_mode: typing.Optional[str] = None,
     ):
         """
         Enables to control the service type of the pod and the addition of templated ingress host
@@ -684,7 +743,7 @@ class RemoteRuntime(KubeResource):
             "State thresholds do not apply for nuclio as it has its own function pods healthiness monitoring"
         )
 
-    @min_nuclio_versions("1.12.8")
+    @min_nuclio_versions("1.13.1")
     def disable_default_http_trigger(
         self,
     ):
@@ -693,7 +752,7 @@ class RemoteRuntime(KubeResource):
         """
         self.spec.disable_default_http_trigger = True
 
-    @min_nuclio_versions("1.12.8")
+    @min_nuclio_versions("1.13.1")
     def enable_default_http_trigger(
         self,
     ):
@@ -702,49 +761,18 @@ class RemoteRuntime(KubeResource):
         """
         self.spec.disable_default_http_trigger = False
 
+    def skip_image_enrichment(self):
+        # make sure the API does not enrich the base image if the function is not a python function
+        return self.spec.nuclio_runtime and "python" not in self.spec.nuclio_runtime
+
     def _get_state(
         self,
-        dashboard="",
         last_log_timestamp=0,
         verbose=False,
         raise_on_exception=True,
-        resolve_address=True,
-        auth_info: AuthInfo = None,
     ) -> tuple[str, str, typing.Optional[float]]:
-        if dashboard:
-            (
-                state,
-                address,
-                name,
-                last_log_timestamp,
-                text,
-                function_status,
-            ) = get_nuclio_deploy_status(
-                self.metadata.name,
-                self.metadata.project,
-                self.metadata.tag,
-                dashboard,
-                last_log_timestamp=last_log_timestamp,
-                verbose=verbose,
-                resolve_address=resolve_address,
-                auth_info=auth_info,
-            )
-            self.status.internal_invocation_urls = function_status.get(
-                "internalInvocationUrls", []
-            )
-            self.status.external_invocation_urls = function_status.get(
-                "externalInvocationUrls", []
-            )
-            self.status.state = state
-            self.status.nuclio_name = name
-            self.status.container_image = function_status.get("containerImage", "")
-            if address:
-                self.status.address = address
-                self.spec.command = f"http://{address}"
-            return state, text, last_log_timestamp
-
         try:
-            text, last_log_timestamp = self._get_db().get_builder_status(
+            text, last_log_timestamp = self._get_db().get_nuclio_deploy_status(
                 self, last_log_timestamp=last_log_timestamp, verbose=verbose
             )
         except mlrun.db.RunDBError:
@@ -850,13 +878,12 @@ class RemoteRuntime(KubeResource):
     def invoke(
         self,
         path: str,
-        body: typing.Union[str, bytes, dict] = None,
-        method: str = None,
-        headers: dict = None,
-        dashboard: str = "",
+        body: typing.Optional[typing.Union[str, bytes, dict]] = None,
+        method: typing.Optional[str] = None,
+        headers: typing.Optional[dict] = None,
         force_external_address: bool = False,
         auth_info: AuthInfo = None,
-        mock: bool = None,
+        mock: typing.Optional[bool] = None,
         **http_client_kwargs,
     ):
         """Invoke the remote (live) function and return the results
@@ -869,7 +896,6 @@ class RemoteRuntime(KubeResource):
         :param body:     request body (str, bytes or a dict for json requests)
         :param method:   HTTP method (GET, PUT, ..)
         :param headers:  key/value dict with http headers
-        :param dashboard: nuclio dashboard address (deprecated)
         :param force_external_address:   use the external ingress URL
         :param auth_info: service AuthInfo
         :param mock:     use mock server vs a real Nuclio function (for local simulations)
@@ -877,14 +903,6 @@ class RemoteRuntime(KubeResource):
                                      see this link for more information:
                                      https://requests.readthedocs.io/en/latest/api/#requests.request
         """
-        if dashboard:
-            # TODO: remove in 1.8.0
-            warnings.warn(
-                "'dashboard' parameter is no longer supported on client side, "
-                "it is being configured through the MLRun API. It will be removed in 1.8.0.",
-                FutureWarning,
-            )
-
         if not method:
             method = "POST" if body else "GET"
 
@@ -914,7 +932,7 @@ class RemoteRuntime(KubeResource):
                         "so function can not be invoked via http. Either enable default http trigger creation or "
                         "create custom http trigger"
                     )
-                state, _, _ = self._get_state(dashboard, auth_info=auth_info)
+                state, _, _ = self._get_state()
                 if state not in ["ready", "scaledToZero"]:
                     logger.warning(f"Function is in the {state} state")
                 if not self.status.address:
@@ -958,14 +976,15 @@ class RemoteRuntime(KubeResource):
 
     def with_sidecar(
         self,
-        name: str = None,
-        image: str = None,
+        name: typing.Optional[str] = None,
+        image: typing.Optional[str] = None,
         ports: typing.Optional[typing.Union[int, list[int]]] = None,
         command: typing.Optional[str] = None,
         args: typing.Optional[list[str]] = None,
     ):
         """
         Add a sidecar container to the function pod
+
         :param name:    Sidecar container name.
         :param image:   Sidecar container image.
         :param ports:   Sidecar container ports to expose. Can be a single port or a list of ports.
@@ -995,12 +1014,13 @@ class RemoteRuntime(KubeResource):
         if command and not command.startswith("http"):
             sidecar["command"] = mlrun.utils.helpers.as_list(command)
 
-        if args and sidecar["command"]:
+        if args and sidecar.get("command"):
             sidecar["args"] = mlrun.utils.helpers.as_list(args)
 
-        # populate the sidecar resources from the function spec
+        # put the configured resources on the sidecar container instead of the reverse proxy container
         if self.spec.resources:
             sidecar["resources"] = self.spec.resources
+            self.spec.resources = None
 
     def _set_sidecar(self, name: str) -> dict:
         self.spec.config.setdefault("spec.sidecars", [])
@@ -1154,9 +1174,6 @@ class RemoteRuntime(KubeResource):
         return results
 
     def _resolve_invocation_url(self, path, force_external_address):
-        if not path.startswith("/") and path != "":
-            path = f"/{path}"
-
         # internal / external invocation urls is a nuclio >= 1.6.x feature
         # try to infer the invocation url from the internal and if not exists, use external.
         # $$$$ we do not want to use the external invocation url (e.g.: ingress, nodePort, etc.)
@@ -1165,12 +1182,16 @@ class RemoteRuntime(KubeResource):
             and self.status.internal_invocation_urls
             and mlrun.k8s_utils.is_running_inside_kubernetes_cluster()
         ):
-            return f"http://{self.status.internal_invocation_urls[0]}{path}"
+            return mlrun.utils.helpers.join_urls(
+                f"http://{self.status.internal_invocation_urls[0]}", path
+            )
 
         if self.status.external_invocation_urls:
-            return f"http://{self.status.external_invocation_urls[0]}{path}"
+            return mlrun.utils.helpers.join_urls(
+                f"http://{self.status.external_invocation_urls[0]}", path
+            )
         else:
-            return f"http://{self.status.address}{path}"
+            return mlrun.utils.helpers.join_urls(f"http://{self.status.address}", path)
 
     def _update_credentials_from_remote_build(self, remote_data):
         self.metadata.credentials = remote_data.get("metadata", {}).get(
@@ -1237,6 +1258,40 @@ class RemoteRuntime(KubeResource):
                 )
 
         return self._resolve_invocation_url("", force_external_address)
+
+    @staticmethod
+    def _resolve_v3io_access_key():
+        # Nuclio supports generating access key for v3io stream trigger only from version 1.13.11
+        if validate_nuclio_version_compatibility("1.13.11"):
+            return mlrun.model.Credentials.generate_access_key
+        return None
+
+    def _check_model_endpoint_task_state(
+        self,
+        db: mlrun.db.RunDBInterface,
+        background_task: mlrun.common.schemas.BackgroundTask,
+        wait_for_completion: bool,
+    ):
+        if wait_for_completion:
+            background_task = db._wait_for_background_task_to_reach_terminal_state(
+                name=background_task.metadata.name, project=self.metadata.project
+            )
+        else:
+            background_task = db.get_project_background_task(
+                project=self.metadata.project, name=background_task.metadata.name
+            )
+        if (
+            background_task.status.state
+            in mlrun.common.schemas.BackgroundTaskState.terminal_states()
+        ):
+            logger.info(
+                f"Model endpoint creation task completed with state {background_task.status.state}"
+            )
+        else:
+            logger.warning(
+                f"Model endpoint creation task is still running with state {background_task.status.state}"
+                f"You can use the serving function, but it won't be monitored for the next few minutes"
+            )
 
 
 def parse_logs(logs):

@@ -70,7 +70,7 @@ You can also view some metadata about the feature vector, including all the feat
 ### Feature vectors with different entities and complex joins
 
 ```{admonition} Note
-Tech Preview
+This feature is currently in Tech Preview status.
 ```
 
 You can define a feature vector that joins between different feature sets not using the same entity and with a "complex" join 
@@ -154,10 +154,10 @@ task = mlrun.new_task(
 run = fn.run(task)
 ```
 
-See a full example of using the offline feature vector to create an ML model in [part 2 of the end-to-end demo](./end-to-end-demo/02-create-training-model.html).
+See a full example of using the offline feature vector to create an ML model in [part 2 of the end-to-end demo](./end-to-end-demo/02-create-training-model.ipynb).
 
 You can use `get_offline_features` for a feature vector whose data is not ingested. See 
-[Create a feature set without ingesting its data](./feature-sets.html#create-a-feature-set-without-ingesting-its-data).
+[Create a feature set without ingesting its data](./feature-sets.md#create-a-feature-set-without-ingesting-its-data).
 
 ### Using joins in an offline feature vector
 
@@ -241,8 +241,7 @@ resp = fs.get_offline_features(
 
 The online feature vector provides real-time feature vectors to the model using the latest data available.
 
-First create an `Online Feature Service` using {py:meth}`~mlrun.feature_store.get_online_feature_service`. Then feed the `Entity` of the 
-feature vector to `get_online_feature_service` and receive the latest value of the feature vector. Note that the response contains only the features - 
+First create an `Online Feature Service` using {py:meth}`~mlrun.feature_store.FeatureVector.get_online_feature_service` and receive the latest value of the feature vector. Note that the response contains only the features - 
 the timestamp (of the last event that updated the feature sets) is not part of the response. 
 
 To create the {py:class}`~mlrun.feature_store.OnlineVectorService` you only need to pass it the feature vector's store reference.
@@ -285,14 +284,14 @@ If you want to return an ordered list of values, set the `as_list` parameter to 
 frameworks and this eliminates additional glue logic. 
    
 When defining a graph using the `join_graph` parameter ({py:meth}`~mlrun.feature_store.FeatureVector`),
-the `get_online_feature_service` uses QueryByKey on the kv store: all join types in the graph turn 
+the `get_online_feature_service` uses QueryByKey on the key-value store: all join types in the graph turn 
 into left joins. Consequently, the function performs joins using the latest events for each required 
 entity within each feature set.
 
 You can use the parameter `entity_keys` to join features by relations, instead of common entities. You define the relations, 
 and the starting place. 
-See {py:meth}`~mlrun.feature_store.get_online_feature_service`.
+See {py:meth}`mlrun.feature_store.FeatureVector.get_online_feature_service`.
 
-See a full example of using the online feature service inside a serving function in [part 3 of the end-to-end demo](./end-to-end-demo/03-deploy-serving-model.html).
+See a full example of using the online feature service inside a serving function in [part 3 of the end-to-end demo](./end-to-end-demo/03-deploy-serving-model.ipynb).
 
 

@@ -33,6 +33,7 @@ import v3io.dataplane.response
 from aioresponses import aioresponses as aioresponses_
 
 import mlrun.common.constants as mlrun_constants
+import mlrun.common.formatters
 import mlrun.common.schemas
 import mlrun.config
 import mlrun.datastore
@@ -43,6 +44,7 @@ import mlrun.launcher.factory
 import mlrun.projects.project
 import mlrun.utils
 import mlrun.utils.singleton
+from mlrun import new_function
 from mlrun.config import config
 from mlrun.lists import ArtifactList
 from mlrun.runtimes import BaseRuntime
@@ -197,7 +199,6 @@ def patch_file_not_found(monkeypatch):
             return MockV3ioObject()
 
     mock_get = mock_failed_get_func(HTTPStatus.NOT_FOUND.value)
-
     monkeypatch.setattr(requests, "get", mock_get)
     monkeypatch.setattr(requests, "head", mock_get)
     monkeypatch.setattr(v3io.dataplane, "Client", MockV3ioClient)
@@ -246,6 +247,7 @@ class RunDBMock:
         self._project = None
         self._runs = {}
         self._api_gateways = {}
+        self._get_model_endpoint_calls = 0
 
     def reset(self):
         self._functions = {}
@@ -265,11 +267,11 @@ class RunDBMock:
     def store_artifact(
         self, key, artifact, uid=None, iter=None, tag="", project="", tree=None
     ):
-        self._artifacts[key] = artifact
+        self._artifacts[(key, iter or 0)] = artifact
         return artifact
 
     def read_artifact(self, key, tag=None, iter=None, project="", tree=None, uid=None):
-        return self._artifacts.get(key, None)
+        return self._artifacts.get((key, iter or 0), None)
 
     def list_artifacts(
         self,
@@ -279,18 +281,46 @@ class RunDBMock:
         labels=None,
         since=None,
         until=None,
-        iter: int = None,
+        iter: Optional[int] = None,
         best_iteration: bool = False,
-        kind: str = None,
+        kind: Optional[str] = None,
         category: Union[str, mlrun.common.schemas.ArtifactCategories] = None,
-        tree: str = None,
-        limit: int = None,
+        tree: Optional[str] = None,
+        format_: Optional[
+            mlrun.common.formatters.ArtifactFormat
+        ] = mlrun.common.formatters.ArtifactFormat.full,
+        limit: Optional[int] = None,
+        partition_by: Optional[
+            Union[mlrun.common.schemas.ArtifactPartitionByField, str]
+        ] = None,
+        rows_per_partition: int = 1,
+        partition_sort_by: Optional[
+            Union[mlrun.common.schemas.SortField, str]
+        ] = mlrun.common.schemas.SortField.updated,
+        partition_order: Union[
+            mlrun.common.schemas.OrderType, str
+        ] = mlrun.common.schemas.OrderType.desc,
     ):
         def filter_artifact(artifact):
             if artifact["metadata"].get("tag", None) == tag:
                 return True
 
         return ArtifactList(filter(filter_artifact, self._artifacts.values()))
+
+    def del_artifact(
+        self,
+        key,
+        tag="",
+        project="",
+        tree=None,
+        uid=None,
+        deletion_strategy: mlrun.common.schemas.artifact.ArtifactsDeletionStrategies = (
+            mlrun.common.schemas.artifact.ArtifactsDeletionStrategies.metadata_only
+        ),
+        secrets: Optional[dict] = None,
+        iter=None,
+    ):
+        self._artifacts.pop((key, iter or 0), None)
 
     def store_run(self, struct, uid, project="", iter=0):
         if hasattr(struct, "to_dict"):
@@ -307,6 +337,14 @@ class RunDBMock:
     def read_run(self, uid, project, iter=0, format_=None):
         return self._runs.get(uid, {})
 
+    def push_run_notifications(
+        self,
+        uid,
+        project="",
+        timeout=45,
+    ):
+        pass
+
     def list_runs(
         self,
         name: Optional[str] = None,
@@ -315,7 +353,6 @@ class RunDBMock:
         labels: Optional[Union[str, list[str]]] = None,
         state: Optional[str] = None,
         sort: bool = True,
-        last: int = 0,
         iter: bool = False,
         start_time_from: Optional[datetime] = None,
         start_time_to: Optional[datetime] = None,
@@ -334,10 +371,23 @@ class RunDBMock:
     ) -> mlrun.lists.RunList:
         return mlrun.lists.RunList(self._runs.values())
 
-    def get_function(self, function, project, tag, hash_key=None):
-        if function not in self._functions:
-            raise mlrun.errors.MLRunNotFoundError("Function not found")
-        return self._functions[function]
+    def get_function(
+        self, function=None, project=None, tag=None, hash_key=None, name=None
+    ):
+        if name:
+            func = new_function(
+                name=name,
+                tag=tag,
+            )
+            func.metadata.uid = "my_uid"
+            return func.to_dict()
+        elif function and function not in self._functions:
+            raise mlrun.errors.MLRunNotFoundError(f"Function {function} not found")
+        elif function and function in self._functions:
+            return self._functions[function]
+
+    def delete_function(self, name: str, project: str = ""):
+        self._functions.pop(name, None)
 
     def submit_job(self, runspec, schedule=None):
         return {"status": {"status_text": "just a status"}}
@@ -395,6 +445,7 @@ class RunDBMock:
         function.setdefault("status", {})
         function["status"]["state"] = "ready"
         function["status"]["nuclio_name"] = "test-nuclio-name"
+        function["status"]["container_image"] = function["metadata"]["name"]
         self._functions[function["metadata"]["name"]] = function
         return {
             "data": {
@@ -406,13 +457,19 @@ class RunDBMock:
 
     def get_builder_status(
         self,
-        func: BaseRuntime,
+        func: mlrun.runtimes.RemoteRuntime,
         offset: int = 0,
         logs: bool = True,
         last_log_timestamp: float = 0,
         verbose: bool = False,
+        events_offset: int = 0,
     ):
         func.status.state = mlrun.common.schemas.FunctionState.ready
+        if func.kind in mlrun.runtimes.RuntimeKinds.pure_nuclio_deployed_runtimes():
+            func.status.external_invocation_urls = [
+                api_gateways.get_invoke_url()
+                for api_gateways in self._api_gateways.values()
+            ]
         return "ready", last_log_timestamp
 
     def deploy_nuclio_function(
@@ -429,6 +486,10 @@ class RunDBMock:
         verbose: bool = False,
     ):
         func.status.state = mlrun.common.schemas.FunctionState.ready
+        func.status.external_invocation_urls = [
+            api_gateways.get_invoke_url()
+            for api_gateways in self._api_gateways.values()
+        ]
         return "ready", last_log_timestamp
 
     def store_api_gateway(
@@ -443,7 +504,7 @@ class RunDBMock:
         self._api_gateways[key] = api_gateway
         return api_gateway
 
-    def get_api_gateway(self, name: str, project: str = None):
+    def get_api_gateway(self, name: str, project: Optional[str] = None):
         key = self._generate_api_gateway_key(name, project)
         api_gateway = self._api_gateways.get(key)
         if api_gateway:
@@ -579,7 +640,7 @@ class RunDBMock:
     ):
         pass
 
-    def _get_function_internal(self, function_name: str = None):
+    def _get_function_internal(self, function_name: Optional[str] = None):
         if function_name:
             return self._functions[function_name]
 
@@ -614,6 +675,78 @@ class RunDBMock:
         categories = function["metadata"]["categories"]
 
         assert categories == expected_categories
+
+    def get_model_endpoint(
+        self,
+        project: str = "default",
+        name: str = "default",
+        function_name: Optional[str] = "function-1",
+        function_uid: Optional[str] = None,
+        function_tag: Optional[str] = "v1",
+        model_name: Optional[str] = None,
+        model_uid: Optional[str] = None,
+        tsdb_metrics: Optional[str] = None,
+    ) -> mlrun.common.schemas.model_monitoring.ModelEndpoint:
+        self._get_model_endpoint_calls += 1
+        name = str.split(name, ":")[0]
+        model_uid = model_uid or f"{name}_uid"
+        return mlrun.common.schemas.model_monitoring.ModelEndpoint(
+            metadata=mlrun.common.schemas.model_monitoring.ModelEndpointMetadata(
+                name=name,
+                project=project,
+                labels={},
+                uid=model_uid,
+            ),
+            spec=mlrun.common.schemas.model_monitoring.ModelEndpointSpec(
+                function_name=function_name,
+                function_tag=function_tag,
+                function_uid=function_uid,
+                model_name=model_name,
+                model_uid=model_uid,
+                model_class="modelcc",
+                model_tag="latest",
+            ),
+            status=mlrun.common.schemas.model_monitoring.ModelEndpointStatus(
+                monitoring_mode=mlrun.common.schemas.model_monitoring.ModelMonitoringMode.enabled,
+            ),
+        )
+
+    def assert_called_get_model_endpoint_once(self):
+        assert self._get_model_endpoint_calls == 1
+
+    def list_model_endpoints(
+        self,
+        project: str = "default",
+        names: Optional[Union[str, list[str]]] = None,
+        function_name: Optional[str] = None,
+        function_tag: Optional[str] = None,
+        model_name: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        labels: Optional[Union[str, dict[str, Optional[str]], list[str]]] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        tsdb_metrics: bool = True,
+        top_level: bool = False,
+        uids: Optional[list[str]] = None,
+        latest_only: bool = False,
+    ) -> mlrun.common.schemas.ModelEndpointList:
+        if isinstance(names, str):
+            names = [names]
+        endpoints = []
+        for name in names:
+            endpoints.append(
+                mlrun.common.schemas.model_monitoring.ModelEndpoint(
+                    metadata=mlrun.common.schemas.ModelEndpointMetadata(
+                        name=name, project=project, uid=f"{name}-uid"
+                    ),
+                    spec=mlrun.common.schemas.ModelEndpointSpec(),
+                    status=mlrun.common.schemas.ModelEndpointStatus(),
+                )
+            )
+
+        return mlrun.common.schemas.model_monitoring.ModelEndpointList(
+            endpoints=endpoints
+        )
 
 
 @pytest.fixture()
@@ -693,6 +826,7 @@ class RemoteBuilderMock(RunDBMock):
         logs: bool = True,
         last_log_timestamp: float = 0,
         verbose: bool = False,
+        events_offset: int = 0,
     ):
         func.status.state = mlrun.common.schemas.FunctionState.ready
         return "ready", last_log_timestamp

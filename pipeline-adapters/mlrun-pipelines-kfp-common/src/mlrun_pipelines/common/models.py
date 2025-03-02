@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import enum
 
-from enum import Enum
+
+class StrEnum(str, enum.Enum):
+    def __str__(self):
+        return self.value
+
+    def __repr__(self):
+        return self.value
 
 
-class RunStatuses(str, Enum):
+class RunStatuses(StrEnum):
     """
     Class for different types of statuses a 'PipelineRun' can have using an enum type.
     Beyond enumerating all possible statuses, this class ensures comparisons are case-insensitive.
@@ -45,6 +52,7 @@ class RunStatuses(str, Enum):
     skipped = "Skipped"
     error = "Error"  # available only on KFP 1.8 or lower
     running = "Running"
+    unknown = "Unknown"
 
     # States available only on KFP 2.0
     runtime_state_unspecified = "Runtime_State_Unspecified"
@@ -83,6 +91,7 @@ class RunStatuses(str, Enum):
             RunStatuses.canceling,
             RunStatuses.canceled,
             RunStatuses.paused,
+            RunStatuses.unknown,
         ]
 
     @staticmethod
@@ -101,4 +110,11 @@ class RunStatuses(str, Enum):
             status
             for status in RunStatuses.all()
             if status not in RunStatuses.stable_statuses()
+        ]
+
+    @classmethod
+    def retryable_statuses(cls):
+        return cls.stable_statuses() + [
+            RunStatuses.unknown,
+            RunStatuses.runtime_state_unspecified,
         ]

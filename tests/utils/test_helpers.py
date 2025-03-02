@@ -16,6 +16,7 @@ import asyncio
 import re
 import unittest.mock
 from contextlib import nullcontext as does_not_raise
+from datetime import datetime, timezone
 
 import pytest
 from pandas import Timedelta, Timestamp
@@ -33,6 +34,7 @@ from mlrun.utils.helpers import (
     get_parsed_docker_registry,
     get_pretty_types_names,
     get_regex_list_as_string,
+    parse_artifact_uri,
     resolve_image_tag_suffix,
     str_to_timestamp,
     template_artifact_path,
@@ -44,7 +46,10 @@ from mlrun.utils.helpers import (
     verify_list_items_type,
 )
 
-STORE_PREFIX = "store://artifacts/dummy-project/dummy-db-key"
+STORE_PREFIX = "store://{kind}/dummy-project/dummy-db-key"
+ARTIFACT_STORE_PREFIX = STORE_PREFIX.format(kind=StorePrefix.Artifact)
+DATASET_STORE_PREFIX = STORE_PREFIX.format(kind=StorePrefix.Dataset)
+MODEL_STORE_PREFIX = STORE_PREFIX.format(kind=StorePrefix.Model)
 
 
 def test_retry_until_successful_fatal_failure():
@@ -57,6 +62,23 @@ def test_retry_until_successful_fatal_failure():
         mlrun.utils.helpers.retry_until_successful(
             0, 1, logger, True, _raise_fatal_failure
         )
+
+
+@pytest.mark.parametrize(
+    "d,expected",
+    [
+        (
+            "2024-11-11 07:44:56.255000+0000",
+            datetime(2024, 11, 11, 7, 44, 56, 255000, tzinfo=timezone.utc),
+        ),
+        (
+            "2024-11-11 07:44:56+0000",
+            datetime(2024, 11, 11, 7, 44, 56, tzinfo=timezone.utc),
+        ),
+    ],
+)
+def test_enrich_datetime_with_tz_info(d, expected: datetime):
+    assert expected == mlrun.utils.helpers.enrich_datetime_with_tz_info(d)
 
 
 def test_retry_until_successful_sync():
@@ -318,11 +340,20 @@ def test_validate_tag_name(tag_name, expected):
             pytest.raises(mlrun.errors.MLRunInvalidArgumentError),
         ),
         ("", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        (
+            "artifact-name#",
+            pytest.raises(mlrun.errors.MLRunInvalidArgumentError),
+        ),
+        ("artifact@name", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("artifact#name", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("artifact-name#", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("artifact:name", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("artifact_name$", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
         # Valid names
         ("artifact-name2.0", does_not_raise()),
-        ("artifact-name", does_not_raise()),
-        ("artifact-name", does_not_raise()),
-        ("artifact-name_chars@#$", does_not_raise()),
+        ("artifact-name3", does_not_raise()),
+        ("artifact_name", does_not_raise()),
+        ("artifact.name", does_not_raise()),
         ("artifactNAME", does_not_raise()),
     ],
 )
@@ -332,6 +363,130 @@ def test_validate_artifact_name(artifact_name, expected):
             artifact_name,
             field_name="artifact.key",
         )
+    with expected:
+        validate_artifact_key_name(
+            artifact_name,
+            field_name="artifact.db_key",
+        )
+
+
+@pytest.mark.parametrize(
+    "uri,project,expected_project,expected_key,expected_iteration,expected_tag,expected_tree,expected_uid",
+    [
+        # Backward compatibility: URI without uid
+        ("artifact_key", "default", "default", "artifact_key", 0, None, None, None),
+        (
+            "project_name/artifact_key",
+            "",
+            "project_name",
+            "artifact_key",
+            0,
+            None,
+            None,
+            None,
+        ),
+        (
+            "project_name/artifact_key#1",
+            "",
+            "project_name",
+            "artifact_key",
+            1,
+            None,
+            None,
+            None,
+        ),
+        (
+            "project_name/artifact_key:latest",
+            "",
+            "project_name",
+            "artifact_key",
+            0,
+            "latest",
+            None,
+            None,
+        ),
+        (
+            "project_name/artifact_key@a1b2c3",
+            "",
+            "project_name",
+            "artifact_key",
+            0,
+            None,
+            "a1b2c3",
+            None,
+        ),
+        (
+            "artifact_key#2:tag@us3jfdrkj",
+            "default",
+            "default",
+            "artifact_key",
+            2,
+            "tag",
+            "us3jfdrkj",
+            None,
+        ),
+        # New functionality: URI with uid
+        (
+            "artifact_key^uid123",
+            "default",
+            "default",
+            "artifact_key",
+            0,
+            None,
+            None,
+            "uid123",
+        ),
+        (
+            "project_name/artifact_key^uid123",
+            "",
+            "project_name",
+            "artifact_key",
+            0,
+            None,
+            None,
+            "uid123",
+        ),
+        (
+            "project_name/artifact_key#1:latest@branch^uid123",
+            "",
+            "project_name",
+            "artifact_key",
+            1,
+            "latest",
+            "branch",
+            "uid123",
+        ),
+        (
+            "artifact_key@branch^uid123",
+            "default",
+            "default",
+            "artifact_key",
+            0,
+            None,
+            "branch",
+            "uid123",
+        ),
+    ],
+)
+def test_parse_artifact_uri(
+    uri,
+    project,
+    expected_project,
+    expected_key,
+    expected_iteration,
+    expected_tag,
+    expected_tree,
+    expected_uid,
+):
+    result = parse_artifact_uri(uri, project)
+    assert result == (
+        expected_project,
+        expected_key,
+        expected_iteration,
+        expected_tag,
+        expected_tree,
+        expected_uid,
+    ), f"Failed to parse artifact URI: {uri}"
 
 
 @pytest.mark.parametrize(
@@ -834,6 +989,40 @@ def test_get_pretty_types_names():
         assert pretty_result == expected
 
 
+@pytest.mark.parametrize(
+    "value, expected, exception",
+    [
+        # True values
+        ("y", True, does_not_raise()),
+        ("yes", True, does_not_raise()),
+        ("t", True, does_not_raise()),
+        ("true", True, does_not_raise()),
+        ("on", True, does_not_raise()),
+        ("1", True, does_not_raise()),
+        # False values
+        ("n", False, does_not_raise()),
+        ("no", False, does_not_raise()),
+        ("f", False, does_not_raise()),
+        ("false", False, does_not_raise()),
+        ("off", False, does_not_raise()),
+        ("0", False, does_not_raise()),
+        # Invalid values
+        ("maybe", None, pytest.raises(ValueError)),
+        ("2", None, pytest.raises(ValueError)),
+        ("", None, pytest.raises(ValueError)),
+        (" ", None, pytest.raises(ValueError)),
+        # Case insensitivity
+        ("Y", True, does_not_raise()),
+        ("nO", False, does_not_raise()),
+        ("TrUe", True, does_not_raise()),
+        ("FaLsE", False, does_not_raise()),
+    ],
+)
+def test_str_to_bool(value, expected, exception):
+    with exception:
+        assert mlrun.utils.str_to_bool(value) == expected
+
+
 def test_str_to_timestamp():
     now_time = Timestamp("2021-01-01 00:01:00")
     cases = [
@@ -1008,35 +1197,91 @@ def test_is_safe_path(basedir, path, is_symlink, is_valid):
 
 
 @pytest.mark.parametrize(
-    "kind, tag, target_path, expected",
+    "kind, tag, target_path, uid, expected",
     [
-        ("artifact", "v1", "/path/to/artifact", f"{STORE_PREFIX}:v1@dummy-tree"),
-        ("artifact", None, "/path/to/artifact", f"{STORE_PREFIX}:latest@dummy-tree"),
+        (
+            "artifact",
+            "v1",
+            "/path/to/artifact",
+            None,
+            f"{ARTIFACT_STORE_PREFIX}:v1@dummy-tree",
+        ),
+        (
+            "artifact",
+            None,
+            "/path/to/artifact",
+            "dummy-uid",
+            f"{ARTIFACT_STORE_PREFIX}:latest@dummy-tree^dummy-uid",
+        ),
         (
             "artifact",
             "latest",
             "/path/to/artifact",
-            f"{STORE_PREFIX}:latest@dummy-tree",
+            "dummy-uid",
+            f"{ARTIFACT_STORE_PREFIX}:latest@dummy-tree^dummy-uid",
         ),
-        ("dataset", "v1", "/path/to/artifact", f"{STORE_PREFIX}:v1@dummy-tree"),
-        ("dataset", None, "/path/to/artifact", f"{STORE_PREFIX}:latest@dummy-tree"),
-        ("dataset", "latest", "/path/to/artifact", f"{STORE_PREFIX}:latest@dummy-tree"),
-        ("model", "v1", "/path/to/artifact", f"{STORE_PREFIX}:v1@dummy-tree"),
-        ("model", None, "/path/to/artifact", f"{STORE_PREFIX}:latest@dummy-tree"),
-        ("model", "latest", "/path/to/artifact", f"{STORE_PREFIX}:latest@dummy-tree"),
-        ("dir", "v1", "/path/to/artifact", "/path/to/artifact"),
-        ("table", "v1", "/path/to/artifact", "/path/to/artifact"),
-        ("plot", "v1", "/path/to/artifact", "/path/to/artifact"),
+        (
+            "dataset",
+            "v1",
+            "/path/to/artifact",
+            None,
+            f"{DATASET_STORE_PREFIX}:v1@dummy-tree",
+        ),
+        (
+            "dataset",
+            None,
+            "/path/to/artifact",
+            None,
+            f"{DATASET_STORE_PREFIX}:latest@dummy-tree",
+        ),
+        (
+            "dataset",
+            None,
+            "/path/to/artifact",
+            "dummy-uid",
+            f"{DATASET_STORE_PREFIX}:latest@dummy-tree^dummy-uid",
+        ),
+        (
+            "dataset",
+            "latest",
+            "/path/to/artifact",
+            None,
+            f"{DATASET_STORE_PREFIX}:latest@dummy-tree",
+        ),
+        (
+            "model",
+            "v1",
+            "/path/to/artifact",
+            "dummy-uid",
+            f"{MODEL_STORE_PREFIX}:v1@dummy-tree^dummy-uid",
+        ),
+        (
+            "model",
+            None,
+            "/path/to/artifact",
+            None,
+            f"{MODEL_STORE_PREFIX}:latest@dummy-tree",
+        ),
+        (
+            "model",
+            "latest",
+            "/path/to/artifact",
+            "dummy-uid",
+            f"{MODEL_STORE_PREFIX}:latest@dummy-tree^dummy-uid",
+        ),
+        ("dir", "v1", "/path/to/artifact", "dummy-uid", "/path/to/artifact"),
+        ("table", "v1", "/path/to/artifact", "dummy-uid", "/path/to/artifact"),
+        ("plot", "v1", "/path/to/artifact", "dummy-uid", "/path/to/artifact"),
     ],
 )
-def test_get_artifact_target(kind, tag, target_path, expected):
+def test_get_artifact_target(kind, tag, target_path, uid, expected):
     item = {
         "kind": kind,
         "spec": {
             "db_key": "dummy-db-key",
             "target_path": target_path,
         },
-        "metadata": {"tree": "dummy-tree", "tag": tag},
+        "metadata": {"tree": "dummy-tree", "tag": tag, "uid": uid},
     }
     target = mlrun.utils.get_artifact_target(item, project="dummy-project")
     assert target == expected
@@ -1055,6 +1300,20 @@ def handler():
         "The code file contains a function named “handler“, which is reserved. "
         + "Use a different name for your function."
     )
+
+
+@pytest.mark.parametrize(
+    "obj, expected",
+    [
+        ({"a": 1, "b": 2}, {"a": 1, "b": 2}),
+        ('{"a": 1, "b": 2}', {"a": 1, "b": 2}),
+        ({}, {}),
+        ("{}", {}),
+        (None, None),
+    ],
+)
+def test_as_dict(obj, expected):
+    assert expected == mlrun.utils.helpers.as_dict(obj)
 
 
 @pytest.mark.parametrize(
@@ -1093,3 +1352,86 @@ def test_validate_single_def_handler_valid_handler(code):
         pytest.fail(
             "validate_single_def_handler raised MLRunInvalidArgumentError unexpectedly."
         )
+
+
+@pytest.mark.parametrize(
+    "base_url, path, expected_result",
+    [
+        # Base URL without trailing slash
+        (
+            "http://example.com",
+            "path/to/resource",
+            "http://example.com/path/to/resource",
+        ),
+        (
+            "http://example.com",
+            "/path/to/resource",
+            "http://example.com/path/to/resource",
+        ),
+        ("http://example.com", "", "http://example.com"),
+        ("http://example.com", None, "http://example.com"),
+        # Base URL with trailing slash
+        (
+            "http://example.com/",
+            "path/to/resource",
+            "http://example.com/path/to/resource",
+        ),
+        (
+            "http://example.com/",
+            "/path/to/resource",
+            "http://example.com/path/to/resource",
+        ),
+        ("http://example.com/", "", "http://example.com/"),
+        ("http://example.com/", None, "http://example.com/"),
+        # Path with or without leading slash
+        ("http://example.com", "path", "http://example.com/path"),
+        ("http://example.com/", "/path", "http://example.com/path"),
+        ("http://example.com", "/path", "http://example.com/path"),
+        # Complex cases
+        (
+            "http://example.com/base",
+            "subpath/resource",
+            "http://example.com/base/subpath/resource",
+        ),
+        (
+            "http://example.com/base/",
+            "/subpath/resource",
+            "http://example.com/base/subpath/resource",
+        ),
+        # Empty base_url
+        (
+            "",
+            "/path",
+            "/path",
+        ),
+        (
+            None,
+            "/path",
+            "/path",
+        ),
+    ],
+)
+def test_join_urls(base_url, path, expected_result):
+    assert mlrun.utils.helpers.join_urls(base_url, path) == expected_result
+
+
+@pytest.mark.parametrize(
+    "input_time, expected_output",
+    [
+        (None, None),
+        # no timezone
+        ("2025-01-15T11:00:00", datetime(2025, 1, 15, 11, 0, 0, tzinfo=timezone.utc)),
+        # timezone-aware datetime (UTC+2), should convert to UTC
+        (
+            "2025-01-15T11:00:00+02:00",
+            datetime(2025, 1, 15, 9, 0, 0, tzinfo=timezone.utc),
+        ),
+        # already in UTC
+        (
+            "2025-01-15T11:00:00+00:00",
+            datetime(2025, 1, 15, 11, 0, 0, tzinfo=timezone.utc),
+        ),
+    ],
+)
+def test_datetime_from_iso(input_time, expected_output):
+    assert mlrun.utils.helpers.datetime_from_iso(input_time) == expected_output

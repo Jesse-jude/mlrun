@@ -19,7 +19,6 @@ from contextlib import nullcontext as does_not_raise
 from datetime import datetime
 from unittest.mock import Mock
 
-import dask.dataframe as dd
 import pandas as pd
 import pytest
 import pytz
@@ -62,26 +61,6 @@ def test_s3_fs_parquet_as_df():
     data_item.as_df()
 
 
-def test_load_object_into_dask_dataframe():
-    # Load a parquet file from Azure Open Datasets
-    os.environ["AZURE_STORAGE_ACCOUNT_NAME"] = "azureopendatastorage"
-    data_item = mlrun.datastore.store_manager.object(
-        "az://tutorials/noaa_isd_weather/demo_data.parquet"
-    )
-    ddf = data_item.as_df(df_module=dd)
-    assert isinstance(ddf, dd.DataFrame)
-
-
-def test_load_object_into_dask_dataframe_using_wasbs_url():
-    # Load a parquet file from Azure Open Datasets
-    os.environ["AZURE_STORAGE_ACCOUNT_NAME"] = "azureopendatastorage"
-    data_item = mlrun.datastore.store_manager.object(
-        "wasbs://tutorials@dummyaccount/noaa_isd_weather/demo_data.parquet"
-    )
-    ddf = data_item.as_df(df_module=dd)
-    assert isinstance(ddf, dd.DataFrame)
-
-
 def test_kafka_source_with_attributes():
     source = KafkaSource(
         brokers="broker_host:9092",
@@ -102,9 +81,10 @@ def test_kafka_source_with_attributes():
     assert attributes["topics"] == ["mytopic"]
     assert attributes["consumerGroup"] == "mygroup"
     assert attributes["sasl"] == {
-        "enabled": True,
+        "enable": True,
         "user": "myuser",
         "password": "mypassword",
+        "mechanism": "PLAIN",
         "handshake": True,
     }
 
@@ -137,9 +117,10 @@ def test_kafka_source_with_attributes_as_ds_profile():
     assert attributes["topics"] == ["mytopic"]
     assert attributes["consumerGroup"] == "mygroup"
     assert attributes["sasl"] == {
-        "enabled": True,
+        "enable": True,
         "user": "myuser",
         "password": "mypassword",
+        "mechanism": "PLAIN",
         "handshake": True,
     }
 
@@ -194,9 +175,10 @@ def test_kafka_source_without_attributes():
     assert attributes["topics"] == ["mytopic"]
     assert attributes["consumerGroup"] == "mygroup"
     assert attributes["sasl"] == {
-        "enabled": True,
+        "enable": True,
         "user": "myuser",
         "password": "mypassword",
+        "mechanism": "PLAIN",
     }
 
 

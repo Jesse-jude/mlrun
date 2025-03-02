@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# flake8: noqa  - this is until we take care of the F401 violations with respect to __all__ & sphinx
-
 __all__ = [
     "get_version",
     "set_environment",
@@ -29,9 +27,9 @@ __all__ = [
 ]
 
 from os import environ, path
+from typing import Optional
 
 import dotenv
-import mlrun_pipelines
 
 from .config import config as mlconf
 from .datastore import DataItem, store_manager
@@ -41,6 +39,7 @@ from .execution import MLClientCtx
 from .model import RunObject, RunTemplate, new_task
 from .package import ArtifactType, DefaultPackager, Packager, handler
 from .projects import (
+    MlrunProject,
     ProjectMetadata,
     build_function,
     deploy_function,
@@ -61,18 +60,19 @@ from .run import (
     get_pipeline,
     import_function,
     new_function,
+    retry_pipeline,
     wait_for_pipeline_completion,
 )
-from .runtimes import new_model_server
+from .runtimes import mounts, new_model_server
 from .secrets import get_secret_or_env
 from .utils.version import Version
 
 __version__ = Version().get()["version"]
 
-VolumeMount = mlrun_pipelines.common.mounts.VolumeMount
-mount_v3io = mlrun_pipelines.mounts.mount_v3io
-v3io_cred = mlrun_pipelines.mounts.v3io_cred
-auto_mount = mlrun_pipelines.mounts.auto_mount
+VolumeMount = mounts.VolumeMount
+mount_v3io = mounts.mount_v3io
+v3io_cred = mounts.v3io_cred
+auto_mount = mounts.auto_mount
 
 
 def get_version():
@@ -88,12 +88,12 @@ if "IGZ_NAMESPACE_DOMAIN" in environ:
 
 
 def set_environment(
-    api_path: str = None,
+    api_path: Optional[str] = None,
     artifact_path: str = "",
-    access_key: str = None,
-    username: str = None,
-    env_file: str = None,
-    mock_functions: str = None,
+    access_key: Optional[str] = None,
+    username: Optional[str] = None,
+    env_file: Optional[str] = None,
+    mock_functions: Optional[str] = None,
 ):
     """set and test default config for: api path, artifact_path and project
 
@@ -136,15 +136,16 @@ def set_environment(
     if not mlconf.dbpath:
         raise ValueError("DB/API path was not detected, please specify its address")
 
-    if mock_functions is not None:
-        mock_functions = "1" if mock_functions is True else mock_functions
-        mlconf.force_run_local = mock_functions
-        mlconf.mock_nuclio_deployment = mock_functions
-
     # check connectivity and load remote defaults
     get_run_db()
     if api_path:
         environ["MLRUN_DBPATH"] = mlconf.dbpath
+    mlconf.reload()
+
+    if mock_functions is not None:
+        mock_functions = "1" if mock_functions is True else mock_functions
+        mlconf.force_run_local = mock_functions
+        mlconf.mock_nuclio_deployment = mock_functions
 
     if not mlconf.artifact_path and not artifact_path:
         raise ValueError(
@@ -159,13 +160,14 @@ def set_environment(
                 "artifact_path must refer to an absolute path" " or a valid url"
             )
         mlconf.artifact_path = artifact_path
+
     return mlconf.default_project, mlconf.artifact_path
 
 
-def get_current_project(silent=False):
+def get_current_project(silent: bool = False) -> Optional[MlrunProject]:
     if not pipeline_context.project and not silent:
         raise MLRunInvalidArgumentError(
-            "current project is not initialized, use new, get or load project methods first"
+            "No current project is initialized. Use new, get or load project functions first."
         )
     return pipeline_context.project
 
@@ -182,7 +184,7 @@ def get_sample_path(subpath=""):
     return samples_path
 
 
-def set_env_from_file(env_file: str, return_dict: bool = False):
+def set_env_from_file(env_file: str, return_dict: bool = False) -> Optional[dict]:
     """Read and set and/or return environment variables from a file
     the env file should have lines in the form KEY=VALUE, comment line start with "#"
 
@@ -211,7 +213,9 @@ def set_env_from_file(env_file: str, return_dict: bool = False):
     env_vars = dotenv.dotenv_values(env_file)
     if None in env_vars.values():
         raise MLRunInvalidArgumentError("env file lines must be in the form key=value")
+
     for key, value in env_vars.items():
-        environ[key] = value  # Load to local environ
+        environ[key] = value
+
     mlconf.reload()  # reload mlrun configuration
     return env_vars if return_dict else None

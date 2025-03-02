@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 
 import datetime
 import json
@@ -24,6 +24,7 @@ import sys
 import time
 import typing
 import urllib.parse
+from typing import Union
 
 import click
 import paramiko
@@ -70,24 +71,25 @@ class SystemTestPreparer:
 
     def __init__(
         self,
-        mlrun_version: str = None,
-        override_image_registry: str = None,
-        mlrun_commit: str = None,
-        mlrun_ui_version: str = None,
-        data_cluster_ip: str = None,
-        data_cluster_ssh_username: str = None,
-        data_cluster_ssh_password: str = None,
-        github_access_token: str = None,
-        provctl_download_url: str = None,
-        provctl_download_s3_access_key: str = None,
-        provctl_download_s3_key_id: str = None,
-        username: str = None,
-        access_key: str = None,
-        iguazio_version: str = None,
-        slack_webhook_url: str = None,
+        mlrun_version: typing.Optional[str] = None,
+        override_image_registry: typing.Optional[str] = None,
+        mlrun_commit: typing.Optional[str] = None,
+        mlrun_ui_version: typing.Optional[str] = None,
+        data_cluster_ip: typing.Optional[str] = None,
+        data_cluster_ssh_username: typing.Optional[str] = None,
+        data_cluster_ssh_password: typing.Optional[str] = None,
+        github_access_token: typing.Optional[str] = None,
+        provctl_download_url: typing.Optional[str] = None,
+        provctl_download_s3_access_key: typing.Optional[str] = None,
+        provctl_download_s3_key_id: typing.Optional[str] = None,
+        username: typing.Optional[str] = None,
+        access_key: typing.Optional[str] = None,
+        iguazio_version: typing.Optional[str] = None,
+        slack_webhook_url: typing.Optional[str] = None,
         debug: bool = False,
-        branch: str = None,
-        mlrun_dbpath: str = None,
+        branch: typing.Optional[str] = None,
+        mlrun_dbpath: typing.Optional[str] = None,
+        kubeconfig_content: typing.Optional[str] = None,
     ):
         self._logger = logger
         self._debug = debug
@@ -109,7 +111,7 @@ class SystemTestPreparer:
         self._ssh_client: typing.Optional[paramiko.SSHClient] = None
         self._mlrun_dbpath = mlrun_dbpath
 
-        self._env_config = {
+        self._env_config: dict[str, Union[str, None, dict]] = {
             "MLRUN_DBPATH": mlrun_dbpath,
             "V3IO_USERNAME": username,
             "V3IO_ACCESS_KEY": access_key,
@@ -118,6 +120,7 @@ class SystemTestPreparer:
             # Setting to MLRUN_SYSTEM_TESTS_GIT_TOKEN instead of GIT_TOKEN, to not affect tests which doesn't need it
             # (e.g. tests which use public repos, therefor doesn't need that access token)
             "MLRUN_SYSTEM_TESTS_GIT_TOKEN": github_access_token,
+            "MLRUN_SYSTEM_TEST_KUBECONFIG": kubeconfig_content,
         }
 
     def prepare_local_env(self, save_to_path: str = ""):
@@ -174,15 +177,15 @@ class SystemTestPreparer:
     def _run_command(
         self,
         command: str,
-        args: list = None,
-        workdir: str = None,
-        stdin: str = None,
+        args: typing.Optional[list] = None,
+        workdir: typing.Optional[str] = None,
+        stdin: typing.Optional[str] = None,
         live: bool = True,
         suppress_errors: bool = False,
         local: bool = False,
         detach: bool = False,
         verbose: bool = True,
-        suppress_error_strings: list = None,
+        suppress_error_strings: typing.Optional[list] = None,
     ) -> (bytes, bytes):
         workdir = workdir or str(self.Constants.workdir)
         stdout, stderr, exit_status = "", "", 0
@@ -266,9 +269,9 @@ class SystemTestPreparer:
     def _run_command_remotely(
         self,
         command: str,
-        args: list = None,
-        workdir: str = None,
-        stdin: str = None,
+        args: typing.Optional[list] = None,
+        workdir: typing.Optional[str] = None,
+        stdin: typing.Optional[str] = None,
         live: bool = True,
         detach: bool = False,
         verbose: bool = True,
@@ -395,11 +398,29 @@ class SystemTestPreparer:
         )
         self._env_config["V3IO_API"] = f"https://{v3io_api_host}"
         self._env_config["MLRUN_DBPATH"] = f"https://{mlrun_api_url}"
-        self._env_config[
-            "MLRUN_MODEL_ENDPOINT_MONITORING__ENDPOINT_STORE_CONNECTION"
-        ] = "v3io"
+
+        # Since the prepare script is shared across branches, two MM configs are set.
+        # Remove the deprecated config when we stop testing 1.7.x.
+
+        # MM infra for < 1.8.0
         self._env_config["MLRUN_MODEL_ENDPOINT_MONITORING__TSDB_CONNECTION"] = "v3io"
         self._env_config["MLRUN_MODEL_ENDPOINT_MONITORING__STREAM_CONNECTION"] = "v3io"
+
+        # MM infra for >= 1.8.0
+        self._env_config["mlrun_model_monitoring_tsdb_profile"] = json.dumps(
+            {
+                "type": "v3io",
+                "name": "mm-tsdb-profile",
+                "v3io_access_key": None,
+            }
+        )
+        self._env_config["mlrun_model_monitoring_stream_profile"] = json.dumps(
+            {
+                "type": "v3io",
+                "name": "mm-stream-profile",
+                "v3io_access_key": self._env_config["V3IO_ACCESS_KEY"],
+            }
+        )
 
     def _install_dev_utilities(self):
         list_uninstall = [
@@ -463,8 +484,8 @@ class SystemTestPreparer:
         command_name: str,
         max_retries: int = 60,
         interval: int = 10,
-        suppress_error_strings: list = None,
-        ps_verification: str = None,
+        suppress_error_strings: typing.Optional[list] = None,
+        ps_verification: typing.Optional[str] = None,
     ):
         def exec_ps_verification():
             if ps_verification:
@@ -819,6 +840,10 @@ def run(
     "--mlrun-dbpath",
     help="MLRun DB URL",
 )
+@click.option(
+    "--kubeconfig-content",
+    help="Kubeconfig file content encoded in base64",
+)
 def env(
     data_cluster_ip: str,
     data_cluster_ssh_username: str,
@@ -831,6 +856,7 @@ def env(
     github_access_token: str,
     save_to_path: str,
     mlrun_dbpath: str,
+    kubeconfig_content: str,
 ):
     system_test_preparer = SystemTestPreparer(
         data_cluster_ip=data_cluster_ip,
@@ -843,6 +869,7 @@ def env(
         branch=branch,
         github_access_token=github_access_token,
         mlrun_dbpath=mlrun_dbpath,
+        kubeconfig_content=kubeconfig_content,
     )
     try:
         system_test_preparer.connect_to_remote()
@@ -854,11 +881,11 @@ def env(
 
 def run_command(
     command: str,
-    args: list = None,
-    workdir: str = None,
-    stdin: str = None,
+    args: typing.Optional[list] = None,
+    workdir: typing.Optional[str] = None,
+    stdin: typing.Optional[str] = None,
     live: bool = True,
-    log_file_handler: typing.IO[str] = None,
+    log_file_handler: typing.Optional[typing.IO[str]] = None,
 ) -> (str, str, int):
     if workdir:
         command = f"cd {workdir}; " + command
@@ -886,7 +913,7 @@ def run_command(
 
 def _handle_command_stdout(
     stdout_stream: typing.IO[bytes],
-    log_file_handler: typing.IO[str] = None,
+    log_file_handler: typing.Optional[typing.IO[str]] = None,
     live: bool = True,
 ) -> str:
     def _write_to_log_file(text: bytes):

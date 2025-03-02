@@ -14,21 +14,69 @@
 import datetime
 import unittest.mock
 
+import numpy as np
+import pandas as pd
 import pytest
-from mlrun_pipelines.models import PipelineRun
 
 import mlrun
 import mlrun.artifacts
 import mlrun.common.constants as mlrun_constants
 import mlrun.errors
-from tests.conftest import out_path
+from mlrun import new_task
+from mlrun_pipelines.models import PipelineRun
+from tests.conftest import out_path, tag_test, verify_state
+
+
+def my_func(context):
+    print(f"Run: {context.name} (uid={context.uid})")
+
+    context.log_result("float", 1.5)
+    context.log_result("np-float32", np.float32(1.5))
+    context.log_result("date", datetime.datetime(2018, 1, 1))
+    context.log_result("np-date", np.datetime64("2018-01-01"))
+    context.log_result("np-nan", np.nan)
+    context.log_result("np-list", [1.5, np.nan, np.inf])
+    context.log_result("dict", {"x": -1.3, "y": np.float32(1.5), "z": "ab"})
+    context.log_result(
+        "array", np.array([1, 2, 3.2, np.nan, np.datetime64("2018-01-01")])
+    )
+
+    raw_data = {
+        "first_name": ["Jason", "Molly", "Tina", "Jake", "Amy"],
+        "last_name": ["Miller", "Jacobson", "Ali", "Milner", "Cooze"],
+        "x": np.array([1, 2, 3.2, np.nan, 5.5]),
+        "y": [25, 94, 0.1, 57, datetime.datetime(2018, 1, 1)],
+    }
+    df = pd.DataFrame(raw_data, columns=["first_name", "last_name", "x", "y"])
+    context.log_dataset("df1", df=df, format="csv")
+
+    date_rng = pd.date_range("2018-01-01", periods=4, freq="H")
+    df = pd.DataFrame(date_rng, columns=["date"])
+    df["data"] = np.random.rand(4)
+    df["nan"] = np.nan
+    df["datetime"] = pd.to_datetime(df["date"])
+    df["text"] = "x"
+    df = df.set_index("datetime")
+    context.log_dataset("df2", df=df)
+
+    return np.nan
+
+
+def test_log_serialization():
+    function = mlrun.new_function(name="test_serialization", kind="job")
+    base_task = new_task(artifact_path=out_path, handler=my_func)
+    task = tag_test(base_task, "test_serialization")
+    result = function.run(task, local=True)
+    verify_state(result)
 
 
 def test_local_context(rundb_mock):
     project_name = "xtst"
     mlrun.mlconf.artifact_path = out_path
-    context = mlrun.get_or_create_ctx("xx", project=project_name, upload_artifacts=True)
     db = mlrun.get_run_db()
+    context = mlrun.get_or_create_ctx(
+        "xx", rundb=db, project=project_name, upload_artifacts=True
+    )
     run = db.read_run(context._uid, project=project_name)
     assert run["status"]["state"] == "running", "run status not updated in db"
 
@@ -53,13 +101,13 @@ def test_local_context(rundb_mock):
 
     # run state should be updated by the context for local run
     assert run["status"]["state"] == "completed", "run status was not updated in db"
-    assert (
-        run["status"]["artifacts"][0]["metadata"]["key"] == "xx"
-    ), "artifact not updated in db"
-    assert (
-        run["status"]["artifacts"][0]["spec"]["format"] == "z"
-    ), "run/artifact attribute not updated in db"
-    assert run["status"]["artifacts"][1]["spec"]["target_path"].startswith(
+    assert run["status"]["artifact_uris"].get("xx"), "artifact not updated in db"
+
+    artifact = mlrun.datastore.get_store_resource(
+        run["status"]["artifact_uris"].get("xx")
+    )
+    assert artifact.spec.format == "z", "run/artifact attribute not updated in db"
+    assert artifact.spec.target_path.startswith(
         out_path
     ), "artifact not uploaded to subpath"
 
@@ -185,6 +233,27 @@ def test_is_logging_worker(host: str, is_logging_worker: bool):
     context.set_label(mlrun_constants.MLRunInternalLabels.kind, "mpijob")
     context.set_label(mlrun_constants.MLRunInternalLabels.host, host)
     assert context.is_logging_worker() is is_logging_worker
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        "some-owner",
+        None,
+    ],
+)
+def test_artifact_owner(rundb_mock, owner):
+    run_dict = _generate_run_dict()
+    if owner:
+        run_dict["metadata"]["labels"][mlrun_constants.MLRunInternalLabels.owner] = (
+            owner
+        )
+
+    run = mlrun.run.RunObject.from_dict(run_dict)
+    context = mlrun.MLClientCtx.from_dict(run.to_dict())
+
+    artifact = context.log_artifact("artifact", body="123")
+    assert artifact.producer.get("owner") == owner
 
 
 def _generate_run_dict():

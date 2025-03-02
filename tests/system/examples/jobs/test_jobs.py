@@ -17,15 +17,16 @@ import os
 import kfp.compiler
 import kfp.dsl
 import pytest
-from mlrun_pipelines.mounts import mount_v3io
 
 import mlrun.common.constants as mlrun_constants
+import mlrun.utils.helpers
 from mlrun import (
     _run_pipeline,
     code_to_function,
     new_task,
     wait_for_pipeline_completion,
 )
+from mlrun.runtimes.mounts import mount_v3io
 from tests.system.base import TestMLRunSystem
 
 
@@ -143,13 +144,19 @@ class TestJobs(TestMLRunSystem):
             inputs={},
             data_stores=[],
         )
+
+        # get artifact uid
+        model_input_artifact_uri = training_run["status"]["artifact_uris"]["mymodel"]
+        _, key, _, _, _, model_input_artifact_uid = (
+            mlrun.utils.helpers.parse_artifact_uri(model_input_artifact_uri)
+        )
         self._verify_run_spec(
             validation_run["spec"],
             parameters={},
             outputs=["validation", "run_id"],
             output_path=f"v3io:///users/admin/kfp/{workflow_run_id}/",
             inputs={
-                "model": f"store://artifacts/{self.project_name}/my-trainer-training_mymodel:latest@{workflow_run_id}",
+                "model": f"store://models/{self.project_name}/{key}:latest@{workflow_run_id}^{model_input_artifact_uid}",
             },
             data_stores=[],
         )

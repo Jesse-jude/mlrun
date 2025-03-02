@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import os
 import os.path
 import pathlib
@@ -27,6 +26,7 @@ import inflection
 import pytest
 
 import mlrun
+import mlrun.alerts.alert
 import mlrun.artifacts
 import mlrun.common.constants as mlrun_constants
 import mlrun.common.schemas
@@ -38,6 +38,7 @@ import mlrun.runtimes.base
 import mlrun.runtimes.nuclio.api_gateway
 import mlrun.utils.helpers
 import tests.conftest
+from mlrun_pipelines.common.models import RunStatuses
 
 
 @pytest.fixture()
@@ -538,6 +539,32 @@ def test_project_with_setup(context, op):
 
 
 @pytest.mark.parametrize(
+    "setup_file_contents, exception",
+    [
+        (b"def setup(project): return 5", pytest.raises(Exception)),
+        (b"def setup(project): pass", pytest.raises(Exception)),
+        (b"def setup(project): return None", pytest.raises(Exception)),
+        (b"def setup(project): return project", does_not_raise()),
+    ],
+)
+def test_project_setup_must_return_project_object(
+    context, setup_file_contents, exception
+):
+    mlrun_project = mlrun.new_project(context=context, name="projset", save=False)
+    with tempfile.NamedTemporaryFile(dir=context, delete=False, suffix=".py") as fp:
+        fp.write(setup_file_contents)
+
+        # ensure the file is written, so the setup will be imported properly
+        fp.flush()
+        with exception as exc:
+            mlrun.projects.project._run_project_setup(
+                mlrun_project, fp.name, save=False
+            )
+        if exc:
+            assert "must return a project object" in str(exc.value)
+
+
+@pytest.mark.parametrize(
     "sync,expected_num_of_funcs, save",
     [
         (
@@ -625,6 +652,60 @@ def test_set_function_requirements(rundb_mock):
         "y",
         "pandas>1, <3",
     ]
+
+
+@pytest.mark.parametrize(
+    "current_run_state, expected_notifications_count",
+    [
+        (RunStatuses.running, 1),
+        (RunStatuses.succeeded, 2),
+        (RunStatuses.failed, 1),
+    ],
+)
+def test_push_pipeline_notification_kfp_runner(
+    current_run_state, expected_notifications_count
+):
+    notifications = [
+        mlrun.model.Notification(
+            name="slack",
+            kind=mlrun.common.schemas.notification.NotificationKind.slack,
+            when=["completed", "error"],
+        ),
+        mlrun.model.Notification(
+            name="mail",
+            kind=mlrun.common.schemas.notification.NotificationKind.mail,
+            when=["completed"],
+        ),
+        mlrun.model.Notification(
+            name="running-mail-notification",
+            kind=mlrun.common.schemas.notification.NotificationKind.mail,
+            when=["running"],
+        ),
+    ]
+    project = mlrun.projects.project.MlrunProject.from_dict(
+        {
+            "metadata": {
+                "name": "newproj",
+            },
+            "spec": {
+                "default_requirements": ["pandas>1, <3"],
+                "notifications": notifications,
+            },
+        }
+    )
+    with unittest.mock.patch(
+        "mlrun.db.nopdb.NopDB.push_pipeline_notifications"
+    ) as push_pipeline_notifications_mock:
+        pipeline_id = "pipeline-id"
+        message = "message"
+        project.push_pipeline_notification_kfp_runner(
+            pipeline_id=pipeline_id,
+            message=message,
+            current_run_state=current_run_state,
+        )
+        push_pipeline_notifications_mock.assert_called()
+        notifications = push_pipeline_notifications_mock.call_args.args[2]
+        assert len(notifications) == expected_notifications_count
 
 
 def test_backwards_compatibility_get_non_normalized_function_name(rundb_mock):
@@ -990,6 +1071,9 @@ def test_import_artifact_retain_producer(rundb_mock):
         name="project-2", context=f"{base_path}/project_2", save=False
     )
 
+    # set project owners
+    project_1.spec.owner = "owner-1"
+
     # create an artifact with a 'run' producer
     artifact = mlrun.artifacts.Artifact(key="x", body="123", is_inline=True)
     run_name = "my-run"
@@ -1000,6 +1084,7 @@ def test_import_artifact_retain_producer(rundb_mock):
         kind="run",
         project=project_1.name,
         name=run_name,
+        owner=project_1.spec.owner,
     ).get_meta()
 
     # imitate the artifact being produced by a run with uri and without a tag
@@ -1012,6 +1097,7 @@ def test_import_artifact_retain_producer(rundb_mock):
         "kind": "run",
         "name": run_name,
         "tag": run_tag,
+        "owner": project_1.spec.owner,
     }
 
     # export the artifact
@@ -1080,6 +1166,57 @@ def test_replace_exported_artifact_producer(rundb_mock):
     loaded_artifact = project_3.get_artifact(key)
     assert loaded_artifact.producer != artifact.producer
     assert loaded_artifact.producer["name"] == project_3.name
+
+
+@pytest.mark.parametrize(
+    "project_owner,username",
+    [
+        ("project-owner", None),
+        (None, "username"),
+        ("project-owner", "username"),
+        (None, None),
+    ],
+)
+def test_artifact_owner(
+    rundb_mock, project_owner, username, monkeypatch: pytest.MonkeyPatch
+):
+    if username:
+        monkeypatch.setenv("V3IO_USERNAME", username)
+
+    project = mlrun.new_project("artifact-owner", save=False)
+    project.spec.owner = project_owner
+    artifact = project.log_artifact("x", body="123", format="txt")
+    if username:
+        assert artifact.producer.get("owner") == username
+    else:
+        assert artifact.producer.get("owner") == project_owner
+
+
+def test_delete_artifacts_with_iteration(rundb_mock):
+    project_name = "my-project"
+    project = mlrun.new_project(project_name, save=False)
+
+    artifact_key = "my-artifact"
+    for iteration in range(1, 4):
+        artifact = mlrun.artifacts.Artifact(
+            key=artifact_key,
+            body="123",
+        )
+        artifact.db_key = artifact_key
+        artifact.iter = iteration
+        # store the artifacts directly to the rundb as with project iteration is always 0
+        rundb_mock.store_artifact(artifact_key, artifact.to_dict(), iter=iteration)
+
+    artifacts = project.list_artifacts()
+    assert len(artifacts) == 3
+
+    artifact_2 = project.get_artifact(artifact_key, iter=2)
+    assert artifact_2.iter == 2
+
+    project.delete_artifact(artifact_2)
+
+    artifacts = project.list_artifacts()
+    assert len(artifacts) == 2
 
 
 @pytest.mark.parametrize(
@@ -1218,9 +1355,17 @@ def test_function_receives_project_default_image():
     proj1 = mlrun.new_project("proj1", save=False)
     default_image = "myrepo/myimage1"
 
-    # Without a project default image, set_function with file-path for remote kind must get an image
+    # Without a project default image, set_function with file-path in context and repo for remote kind must get an image
     with pytest.raises(ValueError, match="image must be provided"):
-        proj1.set_function(func=func_path, name="func", kind="job", handler="myhandler")
+        proj1.set_source("git://mock.git", pull_at_runtime=False)
+        # Specify the relative path for the file to be considered in the project's context
+        proj1.set_function(
+            func="./assets/handler.py",
+            name="func",
+            kind="job",
+            handler="myhandler",
+            with_repo=True,
+        )
 
     proj1.set_default_image(default_image)
     proj1.set_function(func=func_path, name="func", kind="job", handler="myhandler")
@@ -1893,7 +2038,7 @@ def test_create_api_gateway_valid(
     assert "metadata" in gateway_dict
     assert "spec" in gateway_dict
 
-    assert gateway.invoke_url == "https://gateway-f1-f2-project-name.some-domain.com/"
+    assert gateway.invoke_url == "https://gateway-f1-f2-project-name.some-domain.com"
     if authentication_mode == mlrun.common.schemas.APIGatewayAuthenticationMode.basic:
         assert gateway.authentication.authentication_mode == "basicAuth"
     elif (
@@ -1999,7 +2144,7 @@ def test_list_api_gateways(patched_list_api_gateways, context):
     assert gateways[0].host == "http://gateway-f1-f2-project-name.some-domain.com"
     assert gateways[0].spec.functions == ["project-name/my-func1"]
 
-    assert gateways[1].invoke_url == "http://test-basic-default.domain.com/"
+    assert gateways[1].invoke_url == "http://test-basic-default.domain.com"
 
 
 def test_project_create_remote():
@@ -2145,6 +2290,25 @@ def test_remove_remote(name):
         assert name not in project.spec.repo.remotes
 
 
+def test_set_source():
+    project_name = "project1"
+    project = mlrun.new_project(project_name, save=False)
+    # set source + workdir, make sure it persist correctly
+    project.set_source("git://some/repo", workdir="/x")
+    assert project.spec.source == "git://some/repo"
+    assert project.spec.workdir == "/x"
+
+    # set another source, workdir needs to be reset
+    project.set_source("git://some/other/repo")
+    assert project.spec.source == "git://some/other/repo"
+    assert project.spec.workdir is None
+
+    # set workdir, retain it as source would be the same as it was before
+    project.spec.workdir = "/y"
+    project.set_source("git://some/other/repo")
+    assert project.spec.workdir == "/y"
+
+
 @pytest.mark.parametrize(
     "source_url, pull_at_runtime, base_image, image_name, target_dir",
     [
@@ -2288,6 +2452,48 @@ def test_workflow_path_with_project_workdir():
     assert path == "./context/./workdir/workflow.py"
 
 
+@pytest.mark.parametrize(
+    "alert_data",
+    [None, ""],
+)
+def test_store_alert_config_missing_alert_data(alert_data):
+    project_name = "dummy-project"
+    project = mlrun.new_project(project_name, save=False)
+    with pytest.raises(
+        mlrun.errors.MLRunInvalidArgumentError, match="Alert data must be provided"
+    ):
+        project.store_alert_config(alert_data=alert_data)
+
+
+def test_run_project_sync_functions_fails_silently(rundb_mock):
+    proj = mlrun.new_project("proj", save=False)
+    proj.spec._function_definitions = {
+        "prep-data": {
+            "url": "prep_data.py",
+            "image": "mlrun/mlrun",
+            "handler": "prep_data",
+        },
+        "train": {
+            "url": "/User/some-notebook.ipynb",  # Absolute path
+            "name": "train",
+            "kind": "job",
+            "image": "mlrun/mlrun",
+            "handler": "trainer",
+        },
+    }
+    name = "my-pipeline"
+    proj.set_workflow(
+        name=name,
+        workflow_path=str(assets_path() / "localpipe.py"),
+        handler="my_pipe",
+    )
+
+    # Sync should fail silently and run should fail as the functions were not saved
+    run_status = proj.run(name)
+    assert run_status.state == RunStatuses.failed
+    assert "Function tstfunc not found" in str(run_status.exc)
+
+
 class TestModelMonitoring:
     """Test model monitoring project methods"""
 
@@ -2299,7 +2505,7 @@ class TestModelMonitoring:
     @staticmethod
     def test_enable_wait_for_deployment(project: mlrun.projects.MlrunProject) -> None:
         with unittest.mock.patch.object(
-            project, "_wait_for_functions_deployment", autospec=True
+            project, "_wait_for_functions_deployment"
         ) as mock:
             mlrun.projects.MlrunProject.enable_model_monitoring(
                 project, deploy_histogram_data_drift_app=False, wait_for_deployment=True

@@ -14,7 +14,7 @@
 #
 import typing
 
-import pydantic
+import pydantic.v1
 from deprecated import deprecated
 
 import mlrun.common.types
@@ -25,6 +25,7 @@ from .object import ObjectStatus
 class ArtifactCategories(mlrun.common.types.StrEnum):
     model = "model"
     dataset = "dataset"
+    document = "document"
     other = "other"
 
     # we define the link as a category to prevent import cycles, but it's not a real category
@@ -38,17 +39,35 @@ class ArtifactCategories(mlrun.common.types.StrEnum):
             return [ArtifactCategories.model.value, link_kind], False
         if self.value == ArtifactCategories.dataset.value:
             return [ArtifactCategories.dataset.value, link_kind], False
+        if self.value == ArtifactCategories.document.value:
+            return [ArtifactCategories.document.value, link_kind], False
         if self.value == ArtifactCategories.other.value:
             return (
                 [
                     ArtifactCategories.model.value,
                     ArtifactCategories.dataset.value,
+                    ArtifactCategories.document.value,
                 ],
                 True,
             )
 
+    @classmethod
+    def from_kind(cls, kind: str) -> "ArtifactCategories":
+        if kind in [cls.model.value, cls.dataset.value, cls.document.value]:
+            return cls(kind)
+        return cls.other
 
-class ArtifactIdentifier(pydantic.BaseModel):
+    @staticmethod
+    def all():
+        """Return all applicable artifact categories"""
+        return [
+            ArtifactCategories.model,
+            ArtifactCategories.dataset,
+            ArtifactCategories.document,
+        ]
+
+
+class ArtifactIdentifier(pydantic.v1.BaseModel):
     # artifact kind
     kind: typing.Optional[str]
     key: typing.Optional[str]
@@ -69,7 +88,7 @@ class ArtifactsFormat(mlrun.common.types.StrEnum):
     full = "full"
 
 
-class ArtifactMetadata(pydantic.BaseModel):
+class ArtifactMetadata(pydantic.v1.BaseModel):
     key: str
     project: str
     iter: typing.Optional[int]
@@ -77,10 +96,10 @@ class ArtifactMetadata(pydantic.BaseModel):
     tag: typing.Optional[str]
 
     class Config:
-        extra = pydantic.Extra.allow
+        extra = pydantic.v1.Extra.allow
 
 
-class ArtifactSpec(pydantic.BaseModel):
+class ArtifactSpec(pydantic.v1.BaseModel):
     src_path: typing.Optional[str]
     target_path: typing.Optional[str]
     viewer: typing.Optional[str]
@@ -91,10 +110,10 @@ class ArtifactSpec(pydantic.BaseModel):
     unpackaging_instructions: typing.Optional[dict[str, typing.Any]]
 
     class Config:
-        extra = pydantic.Extra.allow
+        extra = pydantic.v1.Extra.allow
 
 
-class Artifact(pydantic.BaseModel):
+class Artifact(pydantic.v1.BaseModel):
     kind: str
     metadata: ArtifactMetadata
     spec: ArtifactSpec

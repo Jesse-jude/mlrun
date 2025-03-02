@@ -17,11 +17,6 @@ import typing
 
 import mlrun.common
 import mlrun.common.schemas.model_monitoring.constants as mm_constants
-from mlrun.common.schemas.model_monitoring import (
-    EndpointUID,
-    FunctionURI,
-    VersionedModel,
-)
 
 FeatureStats = typing.NewType("FeatureStats", dict[str, dict[str, typing.Any]])
 Histogram = typing.NewType("Histogram", list[list])
@@ -29,29 +24,6 @@ BinCounts = typing.NewType("BinCounts", list[int])
 BinEdges = typing.NewType("BinEdges", list[float])
 
 _MAX_FLOAT = sys.float_info.max
-
-
-def create_model_endpoint_uid(function_uri: str, versioned_model: str):
-    function_uri = FunctionURI.from_string(function_uri)
-    versioned_model = VersionedModel.from_string(versioned_model)
-
-    if (
-        not function_uri.project
-        or not function_uri.function
-        or not versioned_model.model
-    ):
-        raise ValueError("Both function_uri and versioned_model have to be initialized")
-
-    uid = EndpointUID(
-        function_uri.project,
-        function_uri.function,
-        function_uri.tag,
-        function_uri.hash_key,
-        versioned_model.model,
-        versioned_model.version,
-    )
-
-    return uid
 
 
 def parse_model_endpoint_project_prefix(path: str, project_name: str):
@@ -64,40 +36,18 @@ def parse_model_endpoint_store_prefix(store_prefix: str):
     return endpoint, container, path
 
 
-def parse_monitoring_stream_path(
-    stream_uri: str, project: str, function_name: str = None
-):
-    if stream_uri.startswith("kafka://"):
-        if "?topic" in stream_uri:
-            raise mlrun.errors.MLRunInvalidArgumentError(
-                "Custom kafka topic is not allowed"
-            )
-        # Add topic to stream kafka uri
-        if (
-            function_name is None
-            or function_name == mm_constants.MonitoringFunctionNames.STREAM
-        ):
-            stream_uri += f"?topic=monitoring_stream_{project}"
-        else:
-            stream_uri += f"?topic=monitoring_stream_{project}_{function_name}"
+def get_kafka_topic(project: str, function_name: typing.Optional[str] = None) -> str:
+    if (
+        function_name is None
+        or function_name == mm_constants.MonitoringFunctionNames.STREAM
+    ):
+        function_specifier = ""
+    else:
+        function_specifier = f"_{function_name}"
 
-    elif stream_uri.startswith("v3io://") and mlrun.mlconf.is_ce_mode():
-        # V3IO is not supported in CE mode, generating a default http stream path
-        if function_name is None:
-            stream_uri = (
-                mlrun.mlconf.model_endpoint_monitoring.default_http_sink.format(
-                    project=project, namespace=mlrun.mlconf.namespace
-                )
-            )
-        else:
-            stream_uri = (
-                mlrun.mlconf.model_endpoint_monitoring.default_http_sink_app.format(
-                    project=project,
-                    application_name=function_name,
-                    namespace=mlrun.mlconf.namespace,
-                )
-            )
-    return stream_uri
+    return (
+        f"monitoring_stream_{mlrun.mlconf.system_id}_{project}{function_specifier}_v1"
+    )
 
 
 def _get_counts(hist: Histogram) -> BinCounts:

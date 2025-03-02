@@ -19,9 +19,9 @@ import pandas as pd
 import semver
 
 
-def _toPandas(spark_df):
+def _to_pandas(spark_df):
     """
-    Modified version of spark DataFrame.toPandas() –
+    Modified version of spark DataFrame.toPandas() -
     https://github.com/apache/spark/blob/v3.2.3/python/pyspark/sql/pandas/conversion.py#L35
 
     The original code (which is only replaced in pyspark 3.5.0) fails with Pandas 2 installed, with the following error:
@@ -223,27 +223,36 @@ def _to_corrected_pandas_type(dt):
         TimestampType,
     )
 
-    if type(dt) == ByteType:
+    if isinstance(dt, ByteType):
         return np.int8
-    elif type(dt) == ShortType:
+    elif isinstance(dt, ShortType):
         return np.int16
-    elif type(dt) == IntegerType:
+    elif isinstance(dt, IntegerType):
         return np.int32
-    elif type(dt) == LongType:
+    elif isinstance(dt, LongType):
         return np.int64
-    elif type(dt) == FloatType:
+    elif isinstance(dt, FloatType):
         return np.float32
-    elif type(dt) == DoubleType:
+    elif isinstance(dt, DoubleType):
         return np.float64
-    elif type(dt) == BooleanType:
+    elif isinstance(dt, BooleanType):
         return bool
-    elif type(dt) == TimestampType:
+    elif isinstance(dt, TimestampType):
         return "datetime64[ns]"
     else:
         return None
 
 
 def spark_df_to_pandas(spark_df):
+    import pyspark
+
+    if semver.parse(pyspark.__version__) >= semver.Version(3, 5, 0):
+
+        def to_pandas(spark_df_inner):
+            return spark_df_inner.toPandas()
+    else:
+        to_pandas = _to_pandas
+
     # as of pyspark 3.2.3, toPandas fails to convert timestamps unless we work around the issue
     # when we upgrade pyspark, we should check whether this workaround is still necessary
     # see https://stackoverflow.com/questions/76389694/transforming-pyspark-to-pandas-dataframe
@@ -262,9 +271,9 @@ def spark_df_to_pandas(spark_df):
                 )
                 type_conversion_dict[field.name] = "datetime64[ns]"
 
-        df = _toPandas(spark_df)
+        df = to_pandas(spark_df)
         if type_conversion_dict:
             df = df.astype(type_conversion_dict)
         return df
     else:
-        return _toPandas(spark_df)
+        return to_pandas(spark_df)

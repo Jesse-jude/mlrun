@@ -46,13 +46,13 @@ class SlackNotification(NotificationBase):
     async def push(
         self,
         message: str,
-        severity: typing.Union[
-            mlrun.common.schemas.NotificationSeverity, str
+        severity: typing.Optional[
+            typing.Union[mlrun.common.schemas.NotificationSeverity, str]
         ] = mlrun.common.schemas.NotificationSeverity.INFO,
-        runs: typing.Union[mlrun.lists.RunList, list] = None,
-        custom_html: str = None,
-        alert: mlrun.common.schemas.AlertConfig = None,
-        event_data: mlrun.common.schemas.Event = None,
+        runs: typing.Optional[typing.Union[mlrun.lists.RunList, list]] = None,
+        custom_html: typing.Optional[typing.Optional[str]] = None,
+        alert: typing.Optional[mlrun.common.schemas.AlertConfig] = None,
+        event_data: typing.Optional[mlrun.common.schemas.Event] = None,
     ):
         webhook = self.params.get("webhook", None) or mlrun.get_secret_or_env(
             "SLACK_WEBHOOK"
@@ -168,7 +168,11 @@ class SlackNotification(NotificationBase):
 
     def _get_run_line(self, run: dict) -> dict:
         meta = run["metadata"]
-        url = mlrun.utils.helpers.get_ui_url(meta.get("project"), meta.get("uid"))
+        url = mlrun.utils.helpers.get_run_url(
+            meta.get("project"),
+            uid=meta.get("uid"),
+            name=meta.get("name"),
+        )
 
         # Only show the URL if the run is not a function (serving or mlrun function)
         kind = run.get("step_kind")

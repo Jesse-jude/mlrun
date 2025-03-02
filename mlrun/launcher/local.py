@@ -59,7 +59,7 @@ class ClientLocalLauncher(launcher.ClientBaseLauncher):
         schedule: Optional[
             Union[str, mlrun.common.schemas.schedule.ScheduleCronTrigger]
         ] = None,
-        hyperparams: dict[str, list] = None,
+        hyperparams: Optional[dict[str, list]] = None,
         hyper_param_options: Optional[mlrun.model.HyperParamOptions] = None,
         verbose: Optional[bool] = None,
         scrape_metrics: Optional[bool] = None,
@@ -281,5 +281,9 @@ class ClientLocalLauncher(launcher.ClientBaseLauncher):
         # once the run is completed, and we can just push the notifications.
         # Only push from jupyter, not from the CLI.
         # "handler" and "dask" kinds are special cases of local runs which don't set local=True
-        if self._is_run_local or runtime.kind in ["handler", "dask"]:
+        if self._is_run_local or runtime.kind in ["handler"]:
             mlrun.utils.notifications.NotificationPusher([runobj]).push()
+        elif runtime.kind in ["dask"]:
+            runtime._get_db().push_run_notifications(
+                uid=runobj.metadata.uid, project=runobj.metadata.project
+            )

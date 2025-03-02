@@ -28,12 +28,8 @@ import numpy as np
 import mlrun
 import mlrun.common.model_monitoring
 import mlrun.common.schemas.model_monitoring
-from mlrun.errors import err_to_str
 from mlrun.utils import logger, now_date
 
-from ..common.helpers import parse_versioned_object_uri
-from ..config import config
-from .server import GraphServer
 from .utils import RouterToDict, _extract_input_data, _update_result_body
 from .v2_serving import _ModelLogPusher
 
@@ -47,13 +43,13 @@ class BaseModelRouter(RouterToDict):
     def __init__(
         self,
         context=None,
-        name: str = None,
+        name: typing.Optional[str] = None,
         routes=None,
-        protocol: str = None,
-        url_prefix: str = None,
-        health_prefix: str = None,
-        input_path: str = None,
-        result_path: str = None,
+        protocol: typing.Optional[str] = None,
+        url_prefix: typing.Optional[str] = None,
+        health_prefix: typing.Optional[str] = None,
+        input_path: typing.Optional[str] = None,
+        result_path: typing.Optional[str] = None,
         **kwargs,
     ):
         """Model Serving Router, route between child models
@@ -112,7 +108,7 @@ class BaseModelRouter(RouterToDict):
 
         return parsed_event
 
-    def post_init(self, mode="sync"):
+    def post_init(self, mode="sync", **kwargs):
         self.context.logger.info(f"Loaded {list(self.routes.keys())}")
 
     def get_metadata(self):
@@ -250,11 +246,11 @@ class ParallelRun(BaseModelRouter):
     def __init__(
         self,
         context=None,
-        name: str = None,
+        name: typing.Optional[str] = None,
         routes=None,
-        protocol: str = None,
-        url_prefix: str = None,
-        health_prefix: str = None,
+        protocol: typing.Optional[str] = None,
+        url_prefix: typing.Optional[str] = None,
+        health_prefix: typing.Optional[str] = None,
         extend_event=None,
         executor_type: Union[ParallelRunnerModes, str] = ParallelRunnerModes.thread,
         **kwargs,
@@ -393,7 +389,7 @@ class ParallelRun(BaseModelRouter):
                 self._pool = executor_class(
                     max_workers=len(self.routes),
                     initializer=ParallelRun.init_pool,
-                    initargs=(server, routes),
+                    initargs=(server, routes, self.context.is_mock),
                 )
             elif self.executor_type == ParallelRunnerModes.thread:
                 executor_class = concurrent.futures.ThreadPoolExecutor
@@ -456,9 +452,9 @@ class ParallelRun(BaseModelRouter):
         return results
 
     @staticmethod
-    def init_pool(server_spec, routes):
+    def init_pool(server_spec, routes, is_mock):
         server = mlrun.serving.GraphServer.from_dict(server_spec)
-        server.init_states(None, None)
+        server.init_states(None, None, is_mock=is_mock)
         global local_routes
         for route in routes.values():
             route.context = server.context
@@ -482,16 +478,17 @@ class VotingEnsemble(ParallelRun):
     def __init__(
         self,
         context=None,
-        name: str = None,
+        name: typing.Optional[str] = None,
         routes=None,
-        protocol: str = None,
-        url_prefix: str = None,
-        health_prefix: str = None,
-        vote_type: str = None,
-        weights: dict[str, float] = None,
+        protocol: typing.Optional[str] = None,
+        url_prefix: typing.Optional[str] = None,
+        health_prefix: typing.Optional[str] = None,
+        vote_type: typing.Optional[str] = None,
+        weights: typing.Optional[dict[str, float]] = None,
         executor_type: Union[ParallelRunnerModes, str] = ParallelRunnerModes.thread,
         format_response_with_col_name_flag: bool = False,
         prediction_col_name: str = "prediction",
+        shard_by_endpoint: typing.Optional[bool] = None,
         **kwargs,
     ):
         """Voting Ensemble
@@ -581,6 +578,8 @@ class VotingEnsemble(ParallelRun):
                               `{id: <id>, model_name: <name>, outputs: {..., prediction: [<predictions>], ...}}`
                               the prediction_col_name should be `prediction`.
                               by default, `prediction`
+        :param shard_by_endpoint: whether to use the endpoint as the partition/sharding key when writing to model
+                                  monitoring stream. Defaults to True.
         :param kwargs:        extra arguments
         """
         super().__init__(
@@ -597,29 +596,78 @@ class VotingEnsemble(ParallelRun):
         self.vote_type = vote_type
         self.vote_flag = True if self.vote_type is not None else False
         self.weights = weights
-        self._model_logger = (
-            _ModelLogPusher(self, context)
-            if context and context.stream.enabled
-            else None
-        )
-        self.version = kwargs.get("version", "v1")
         self.log_router = True
         self.prediction_col_name = prediction_col_name or "prediction"
         self.format_response_with_col_name_flag = format_response_with_col_name_flag
         self.model_endpoint_uid = None
+        self.model_endpoint = None
+        self.shard_by_endpoint = shard_by_endpoint
+        self.initialized = False
 
-    def post_init(self, mode="sync"):
-        server = getattr(self.context, "_server", None) or getattr(
-            self.context, "server", None
-        )
+    def post_init(self, mode="sync", **kwargs):
+        self._update_weights(self.weights)
+
+    def _lazy_init(self, event_id):
+        server: mlrun.serving.GraphServer = getattr(
+            self.context, "_server", None
+        ) or getattr(self.context, "server", None)
         if not server:
             logger.warn("GraphServer not initialized for VotingEnsemble instance")
             return
-
-        if not self.context.is_mock or self.context.server.track_models:
-            self.model_endpoint_uid = _init_endpoint_record(server, self)
-
-        self._update_weights(self.weights)
+        if not self.context.is_mock or self.context.monitoring_mock:
+            if server.model_endpoint_creation_task_name:
+                background_task = mlrun.get_run_db().get_project_background_task(
+                    server.project, server.model_endpoint_creation_task_name
+                )
+                logger.info(
+                    "Checking model endpoint creation task status",
+                    task_name=server.model_endpoint_creation_task_name,
+                )
+                if (
+                    background_task.status.state
+                    in mlrun.common.schemas.BackgroundTaskState.terminal_states()
+                ):
+                    logger.info(
+                        f"Model endpoint creation task completed with state {background_task.status.state}"
+                    )
+                else:  # in progress
+                    logger.debug(
+                        f"Model endpoint creation task is still in progress with the current state: "
+                        f"{background_task.status.state}. This event will not be monitored.",
+                        name=self.name,
+                        event_id=event_id,
+                    )
+                    self.initialized = False
+                    return
+            else:
+                logger.info(
+                    "Model endpoint creation task name not provided",
+                )
+            try:
+                self.model_endpoint_uid = (
+                    mlrun.get_run_db()
+                    .get_model_endpoint(
+                        project=server.project,
+                        name=self.name,
+                        function_name=server.function_name,
+                        function_tag=server.function_tag or "latest",
+                        tsdb_metrics=False,
+                    )
+                    .metadata.uid
+                )
+            except mlrun.errors.MLRunNotFoundError:
+                logger.info(
+                    "Model endpoint not found for this step; monitoring for this model will not be performed",
+                    function_name=server.function_name,
+                    name=self.name,
+                )
+                self.model_endpoint_uid = None
+        self._model_logger = (
+            _ModelLogPusher(self, self.context)
+            if self.context and self.context.stream.enabled and self.model_endpoint_uid
+            else None
+        )
+        self.initialized = True
 
     def _resolve_route(self, body, urlpath):
         """Resolves the appropriate model to send the event to.
@@ -811,7 +859,8 @@ class VotingEnsemble(ParallelRun):
         return self.logic(flattened_predictions, np.array(weights))
 
     def do_event(self, event, *args, **kwargs):
-        """Handles incoming requests.
+        """
+        Handles incoming requests.
 
         Parameters
         ----------
@@ -823,8 +872,9 @@ class VotingEnsemble(ParallelRun):
         Response
             Event response after running the requested logic
         """
+        if not self.initialized:
+            self._lazy_init(event.id)
         start = now_date()
-
         # Handle and verify the request
         original_body = event.body
         event.body = _extract_input_data(self._input_path, event.body)
@@ -876,14 +926,14 @@ class VotingEnsemble(ParallelRun):
                     "model_name": self.name,
                     "outputs": votes,
                 }
-                if self.version:
-                    response_body["model_version"] = self.version
+                if self.model_endpoint_uid:
+                    response_body["model_endpoint_uid"] = self.model_endpoint_uid
                 response.body = response_body
             elif name == self.name and event.method == "GET" and not subpath:
                 response = copy.copy(event)
                 response_body = {
                     "name": self.name,
-                    "version": self.version or "",
+                    "model_endpoint_uid": self.model_endpoint_uid or "",
                     "inputs": [],
                     "outputs": [],
                 }
@@ -908,7 +958,12 @@ class VotingEnsemble(ParallelRun):
         if self._model_logger and self.log_router:
             if "id" not in request:
                 request["id"] = response.body["id"]
-            self._model_logger.push(start, request, response.body)
+            partition_key = (
+                self.model_endpoint_uid if self.shard_by_endpoint is not False else None
+            )
+            self._model_logger.push(
+                start, request, response.body, partition_key=partition_key
+            )
         event.body = _update_result_body(
             self._result_path, original_body, response.body if response else None
         )
@@ -992,148 +1047,25 @@ class VotingEnsemble(ParallelRun):
                 self._weights[model] = 0
 
 
-def _init_endpoint_record(
-    graph_server: GraphServer, voting_ensemble: VotingEnsemble
-) -> Union[str, None]:
-    """
-    Initialize model endpoint record and write it into the DB. In general, this method retrieve the unique model
-    endpoint ID which is generated according to the function uri and the model version. If the model endpoint is
-    already exist in the DB, we skip the creation process. Otherwise, it writes the new model endpoint record to the DB.
-
-    :param graph_server:    A GraphServer object which will be used for getting the function uri.
-    :param voting_ensemble: Voting ensemble serving class. It contains important details for the model endpoint record
-                            such as model name, model path, model version, and the ids of the children model endpoints.
-
-    :return: Model endpoint unique ID.
-    """
-
-    logger.info("Initializing endpoint records")
-
-    # Generate required values for the model endpoint record
-    try:
-        # Getting project name from the function uri
-        project, uri, tag, hash_key = parse_versioned_object_uri(
-            graph_server.function_uri
-        )
-    except Exception as e:
-        logger.error("Failed to parse function URI", exc=err_to_str(e))
-        return None
-
-    # Generating version model value based on the model name and model version
-    if voting_ensemble.version:
-        versioned_model_name = f"{voting_ensemble.name}:{voting_ensemble.version}"
-    else:
-        versioned_model_name = f"{voting_ensemble.name}:latest"
-
-    # Generating model endpoint ID based on function uri and model version
-    endpoint_uid = mlrun.common.model_monitoring.create_model_endpoint_uid(
-        function_uri=graph_server.function_uri, versioned_model=versioned_model_name
-    ).uid
-
-    try:
-        model_ep = mlrun.get_run_db().get_model_endpoint(
-            project=project, endpoint_id=endpoint_uid
-        )
-    except mlrun.errors.MLRunNotFoundError:
-        model_ep = None
-    except mlrun.errors.MLRunBadRequestError as err:
-        logger.debug(
-            f"Cant reach to model endpoints store, due to  : {err}",
-        )
-        return
-
-    if voting_ensemble.context.server.track_models and not model_ep:
-        logger.info("Creating a new model endpoint record", endpoint_id=endpoint_uid)
-        # Get the children model endpoints ids
-        children_uids = []
-        for _, c in voting_ensemble.routes.items():
-            if hasattr(c, "endpoint_uid"):
-                children_uids.append(c.endpoint_uid)
-        model_endpoint = mlrun.common.schemas.ModelEndpoint(
-            metadata=mlrun.common.schemas.ModelEndpointMetadata(
-                project=project, uid=endpoint_uid
-            ),
-            spec=mlrun.common.schemas.ModelEndpointSpec(
-                function_uri=graph_server.function_uri,
-                model=versioned_model_name,
-                model_class=voting_ensemble.__class__.__name__,
-                stream_path=config.model_endpoint_monitoring.store_prefixes.default.format(
-                    project=project, kind="stream"
-                ),
-                active=True,
-                monitoring_mode=mlrun.common.schemas.model_monitoring.ModelMonitoringMode.enabled,
-            ),
-            status=mlrun.common.schemas.ModelEndpointStatus(
-                children=list(voting_ensemble.routes.keys()),
-                endpoint_type=mlrun.common.schemas.model_monitoring.EndpointType.ROUTER,
-                children_uids=children_uids,
-            ),
-        )
-
-        db = mlrun.get_run_db()
-
-        db.create_model_endpoint(
-            project=project,
-            endpoint_id=model_endpoint.metadata.uid,
-            model_endpoint=model_endpoint.dict(),
-        )
-
-        # Update model endpoint children type
-        for model_endpoint in children_uids:
-            current_endpoint = db.get_model_endpoint(
-                project=project, endpoint_id=model_endpoint
-            )
-            current_endpoint.status.endpoint_type = (
-                mlrun.common.schemas.model_monitoring.EndpointType.LEAF_EP
-            )
-            db.create_model_endpoint(
-                project=project,
-                endpoint_id=model_endpoint,
-                model_endpoint=current_endpoint,
-            )
-    elif (
-        model_ep
-        and (
-            model_ep.spec.monitoring_mode
-            == mlrun.common.schemas.model_monitoring.ModelMonitoringMode.enabled
-        )
-        != voting_ensemble.context.server.track_models
-    ):
-        monitoring_mode = (
-            mlrun.common.schemas.model_monitoring.ModelMonitoringMode.enabled
-            if voting_ensemble.context.server.track_models
-            else mlrun.common.schemas.model_monitoring.ModelMonitoringMode.disabled
-        )
-        db = mlrun.get_run_db()
-        db.patch_model_endpoint(
-            project=project,
-            endpoint_id=endpoint_uid,
-            attributes={"monitoring_mode": monitoring_mode},
-        )
-        logger.debug(
-            f"Updating model endpoint monitoring_mode to {monitoring_mode}",
-            endpoint_id=endpoint_uid,
-        )
-
-    return endpoint_uid
-
-
 class EnrichmentModelRouter(ModelRouter):
-    """model router with feature enrichment and imputing"""
+    """
+    Model router with feature enrichment and imputing
+    """
 
     def __init__(
         self,
         context=None,
-        name: str = None,
+        name: typing.Optional[str] = None,
         routes=None,
-        protocol: str = None,
-        url_prefix: str = None,
-        health_prefix: str = None,
+        protocol: typing.Optional[str] = None,
+        url_prefix: typing.Optional[str] = None,
+        health_prefix: typing.Optional[str] = None,
         feature_vector_uri: str = "",
-        impute_policy: dict = None,
+        impute_policy: typing.Optional[dict] = None,
         **kwargs,
     ):
-        """Model router with feature enrichment (from the feature store)
+        """
+        Model router with feature enrichment (from the feature store)
 
         The `EnrichmentModelRouter` class enrich the incoming event with real-time features
         read from a feature vector (in MLRun feature store) and forwards the enriched event to the child models
@@ -1141,27 +1073,25 @@ class EnrichmentModelRouter(ModelRouter):
         The feature vector is specified using the `feature_vector_uri`, in addition an imputing policy
         can be specified to substitute None/NaN values with pre defines constant or stats.
 
-        :param feature_vector_uri :  feature vector uri in the form: [project/]name[:tag]
-        :param impute_policy : value imputing (substitute NaN/Inf values with statistical or constant value),
-                              you can set the `impute_policy` parameter with the imputing policy, and specify which
-                              constant or statistical value will be used instead of NaN/Inf value, this can be defined
-                              per column or for all the columns ("*"). the replaced value can be fixed number for
-                              constants or $mean, $max, $min, $std, $count for statistical values.
-                              “*” is used to specify the default for all features, example:
-                              impute_policy={"*": "$mean", "age": 33}
+        :param feature_vector_uri:  feature vector uri in the form: [project/]name[:tag]
+        :param impute_policy: value imputing (substitute NaN/Inf values with statistical or constant value),
+            you can set the `impute_policy` parameter with the imputing policy, and specify which constant or
+            statistical value will be used instead of NaN/Inf value, this can be defined per column or
+            for all the columns ("*"). The replaced value can be fixed number for constants or $mean, $max, $min, $std,
+            $count for statistical values.
+            “*” is used to specify the default for all features, example: impute_policy={"*": "$mean", "age": 33}
         :param context:       for internal use (passed in init)
         :param name:          step name
         :param routes:        for internal use (routes passed in init)
         :param protocol:      serving API protocol (default "v2")
         :param url_prefix:    url prefix for the router (default /v2/models)
         :param health_prefix: health api url prefix (default /v2/health)
-        :param input_path:    when specified selects the key/path in the event to use as body
-                              this require that the event body will behave like a dict, example:
-                              event: {"data": {"a": 5, "b": 7}}, input_path="data.b" means request body will be 7
-        :param result_path:   selects the key/path in the event to write the results to
-                              this require that the event body will behave like a dict, example:
-                              event: {"x": 5} , result_path="resp" means the returned response will be written
-                              to event["y"] resulting in {"x": 5, "resp": <result>}
+        :param input_path:    when specified selects the key/path in the event to use as body this require that the
+            event body will behave like a dict, example: event: {"data": {"a": 5, "b": 7}}, input_path="data.b"
+            means request body will be 7.
+        :param result_path:   selects the key/path in the event to write the results to this require that the event body
+            will behave like a dict, example: event: {"x": 5} , result_path="resp" means the returned response will be
+            written to event["y"] resulting in {"x": 5, "resp": <result>}
         :param kwargs:        extra arguments
         """
         super().__init__(
@@ -1179,7 +1109,7 @@ class EnrichmentModelRouter(ModelRouter):
 
         self._feature_service = None
 
-    def post_init(self, mode="sync"):
+    def post_init(self, mode="sync", **kwargs):
         from ..feature_store import get_feature_vector
 
         super().post_init(mode)
@@ -1200,33 +1130,37 @@ class EnrichmentModelRouter(ModelRouter):
 
 
 class EnrichmentVotingEnsemble(VotingEnsemble):
-    """Voting Ensemble with feature enrichment (from the feature store)"""
+    """
+    Voting Ensemble with feature enrichment (from the feature store)
+    """
 
     def __init__(
         self,
         context=None,
-        name: str = None,
+        name: typing.Optional[str] = None,
         routes=None,
         protocol=None,
-        url_prefix: str = None,
-        health_prefix: str = None,
-        vote_type: str = None,
+        url_prefix: typing.Optional[str] = None,
+        health_prefix: typing.Optional[str] = None,
+        vote_type: typing.Optional[str] = None,
         executor_type: Union[ParallelRunnerModes, str] = ParallelRunnerModes.thread,
-        prediction_col_name: str = None,
+        prediction_col_name: typing.Optional[str] = None,
         feature_vector_uri: str = "",
-        impute_policy: dict = None,
+        impute_policy: typing.Optional[dict] = None,
         **kwargs,
     ):
-        """Voting Ensemble with feature enrichment (from the feature store)
+        """
+        Voting Ensemble with feature enrichment (from the feature store)
 
         The `EnrichmentVotingEnsemble` class enables to enrich the incoming event with real-time features
         read from a feature vector (in MLRun feature store) and apply prediction logic on top of
         the different added models.
 
         You can use it by calling:
-        - <prefix>/<model>[/versions/<ver>]/operation
+
+        - `<prefix>/<model>[/versions/<ver>]/operation`
             Sends the event to the specific <model>[/versions/<ver>]
-        - <prefix>/operation
+        - `<prefix>/operation`
             Sends the event to all models and applies `vote(self, event)`
 
         The `VotingEnsemble` applies the following logic:
@@ -1237,7 +1171,7 @@ class EnrichmentVotingEnsemble(VotingEnsemble):
         The feature vector is specified using the `feature_vector_uri`, in addition an imputing policy
         can be specified to substitute None/NaN values with pre defines constant or stats.
 
-        * When enabling model tracking via `set_tracking()` the ensemble logic
+        When enabling model tracking via `set_tracking()` the ensemble logic
         predictions will appear with model name as the given VotingEnsemble name
         or "VotingEnsemble" by default.
 
@@ -1245,17 +1179,20 @@ class EnrichmentVotingEnsemble(VotingEnsemble):
 
             # Define a serving function
             # Note: You can point the function to a file containing you own Router or Classifier Model class
-            #       this basic class supports sklearn based models (with `<model>.predict()` api)
-            fn = mlrun.code_to_function(name='ensemble',
-                                        kind='serving',
-                                        filename='model-server.py'
-                                        image='mlrun/mlrun')
+            # this basic class supports sklearn based models (with `<model>.predict()` api)
+            fn = mlrun.code_to_function(
+                name='ensemble',
+                kind='serving',
+                filename='model-server.py',
+                image='mlrun/mlrun')
+
 
             # Set the router class
             # You can set your own classes by simply changing the `class_name`
-            fn.set_topology(class_name='mlrun.serving.routers.EnrichmentVotingEnsemble',
-                            feature_vector_uri="transactions-fraud",
-                            impute_policy={"*": "$mean"})
+            fn.set_topology(
+                class_name='mlrun.serving.routers.EnrichmentVotingEnsemble',
+                feature_vector_uri="transactions-fraud",
+                impute_policy={"*": "$mean"})
 
             # Add models
             fn.add_model(<model_name>, <model_path>, <model_class_name>)
@@ -1277,35 +1214,32 @@ class EnrichmentVotingEnsemble(VotingEnsemble):
         :param context:       for internal use (passed in init)
         :param name:          step name
         :param routes:        for internal use (routes passed in init)
-        :param protocol:      serving API protocol (default "v2")
-        :param url_prefix:    url prefix for the router (default /v2/models)
-        :param health_prefix: health api url prefix (default /v2/health)
-        :param feature_vector_uri :  feature vector uri in the form: [project/]name[:tag]
-        :param impute_policy : value imputing (substitute NaN/Inf values with statistical or constant value),
-                              you can set the `impute_policy` parameter with the imputing policy, and specify which
-                              constant or statistical value will be used instead of NaN/Inf value, this can be defined
-                              per column or for all the columns ("*").
-                              the replaced value can be fixed number for constants or $mean, $max, $min, $std, $count
-                              for statistical values. “*” is used to specify the default for all features, example:
-                              impute_policy={"*": "$mean", "age": 33}
-        :param input_path:    when specified selects the key/path in the event to use as body
-                              this require that the event body will behave like a dict, example:
-                              event: {"data": {"a": 5, "b": 7}}, input_path="data.b" means request body will be 7
-        :param result_path:   selects the key/path in the event to write the results to
-                              this require that the event body will behave like a dict, example:
-                              event: {"x": 5} , result_path="resp" means the returned response will be written
-                              to event["y"] resulting in {"x": 5, "resp": <result>}
-        :param vote_type:     Voting type to be used (from `VotingTypes`).
-                              by default will try to self-deduct upon the first event:
-                                - float prediction type: regression
-                                - int prediction type: classification
+        :param protocol:      serving API protocol (default `v2`)
+        :param url_prefix:    url prefix for the router (default `/v2/models`)
+        :param health_prefix: health api url prefix (default `/v2/health`)
+        :param feature_vector_uri:  feature vector uri in the form `[project/]name[:tag]`
+        :param impute_policy: value imputing (substitute NaN/Inf values with statistical or constant value),
+            you can set the `impute_policy` parameter with the imputing policy, and specify which constant or
+            statistical value will be used instead of NaN/Inf value, this can be defined per column or for all
+            the columns ("*"). The replaced value can be fixed number for constants or $mean, $max, $min, $std, $count
+            for statistical values. “*” is used to specify the default for all features,
+            example: impute_policy={"*": "$mean", "age": 33}
+        :param input_path:    when specified selects the key/path in the event to use as body this require that
+            the event body will behave like a dict, example: event: {"data": {"a": 5, "b": 7}}, input_path="data.b"
+            means request body will be 7.
+        :param result_path:   selects the key/path in the event to write the results to this require that the event body
+            will behave like a dict, example: event: {"x": 5} , result_path="resp" means the returned response will be
+            written to event["y"] resulting in {"x": 5, "resp": <result>}.
+        :param vote_type: Voting type to be used (from `VotingTypes`). by default will try to self-deduct upon the
+                    first event:
+                    * float prediction type: regression
+                    * int prediction type: classification
         :param executor_type: Parallelism mechanism, out of `ParallelRunnerModes`, by default `threads`
         :param prediction_col_name: The dict key for the predictions column in the model's responses output.
-                              Example: If the model returns
-                                       {id: <id>, model_name: <name>, outputs: {..., prediction: [<predictions>], ...}}
-                                       the prediction_col_name should be `prediction`.
-                              by default, `prediction`
-        :param kwargs:        extra arguments
+            Example:
+            If the model returns `{id: <id>, model_name: <name>, outputs: {..., prediction: [<predictions>], ...}}`,
+            the prediction_col_name should be `prediction`. By default, `prediction`.
+        :param kwargs:  extra arguments
         """
         super().__init__(
             context=context,
@@ -1325,7 +1259,7 @@ class EnrichmentVotingEnsemble(VotingEnsemble):
 
         self._feature_service = None
 
-    def post_init(self, mode="sync"):
+    def post_init(self, mode="sync", **kwargs):
         from ..feature_store import get_feature_vector
 
         super().post_init(mode)
@@ -1336,7 +1270,9 @@ class EnrichmentVotingEnsemble(VotingEnsemble):
         )
 
     def preprocess(self, event):
-        """Turn an entity identifier (source) to a Feature Vector"""
+        """
+        Turn an entity identifier (source) to a Feature Vector
+        """
         if isinstance(event.body, (str, bytes)):
             event.body = json.loads(event.body)
         event.body["inputs"] = self._feature_service.get(

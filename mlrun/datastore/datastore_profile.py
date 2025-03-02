@@ -11,15 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import ast
 import base64
 import json
 import typing
 import warnings
-from urllib.parse import ParseResult, urlparse, urlunparse
+from urllib.parse import ParseResult, urlparse
 
-import pydantic
+import pydantic.v1
 from mergedeep import merge
 
 import mlrun
@@ -28,15 +28,15 @@ import mlrun.errors
 from ..secrets import get_secret_or_env
 
 
-class DatastoreProfile(pydantic.BaseModel):
+class DatastoreProfile(pydantic.v1.BaseModel):
     type: str
     name: str
     _private_attributes: list = ()
 
     class Config:
-        extra = pydantic.Extra.forbid
+        extra = pydantic.v1.Extra.forbid
 
-    @pydantic.validator("name")
+    @pydantic.v1.validator("name")
     @classmethod
     def lower_case(cls, v):
         return v.lower()
@@ -75,14 +75,72 @@ class TemporaryClientDatastoreProfiles(metaclass=mlrun.utils.singleton.Singleton
 
 
 class DatastoreProfileBasic(DatastoreProfile):
-    type: str = pydantic.Field("basic")
+    type: str = pydantic.v1.Field("basic")
     _private_attributes = "private"
     public: str
     private: typing.Optional[str] = None
 
 
+class ConfigProfile(DatastoreProfile):
+    """
+    A profile class for managing configuration data with nested public and private attributes.
+    This class extends DatastoreProfile to handle configuration settings, separating them into
+    public and private dictionaries. Both dictionaries support nested structures, and the class
+    provides functionality to merge these attributes when needed.
+
+    Args:
+        public (Optional[dict]): Dictionary containing public configuration settings,
+            supporting nested structures
+        private (Optional[dict]): Dictionary containing private/sensitive configuration settings,
+            supporting nested structures
+
+    Example:
+        >>> public = {
+            "database": {
+                "host": "localhost",
+                "port": 5432
+            },
+            "api_version": "v1"
+        }
+        >>> private = {
+            "database": {
+                "password": "secret123",
+                "username": "admin"
+            },
+            "api_key": "xyz789"
+        }
+        >>> config = ConfigProfile("myconfig", public=public, private=private)
+
+        # When attributes() is called, it merges public and private:
+        # {
+        #     "database": {
+        #         "host": "localhost",
+        #         "port": 5432,
+        #         "password": "secret123",
+        #         "username": "admin"
+        #     },
+        #     "api_version": "v1",
+        #     "api_key": "xyz789"
+        # }
+
+    """
+
+    type = "config"
+    _private_attributes = "private"
+    public: typing.Optional[dict] = None
+    private: typing.Optional[dict] = None
+
+    def attributes(self):
+        res = {}
+        if self.public:
+            res = merge(res, self.public)
+        if self.private:
+            res = merge(res, self.private)
+        return res
+
+
 class DatastoreProfileKafkaTarget(DatastoreProfile):
-    type: str = pydantic.Field("kafka_target")
+    type: str = pydantic.v1.Field("kafka_target")
     _private_attributes = "kwargs_private"
     bootstrap_servers: typing.Optional[str] = None
     brokers: typing.Optional[str] = None
@@ -113,6 +171,9 @@ class DatastoreProfileKafkaTarget(DatastoreProfile):
                 FutureWarning,
             )
 
+    def get_topic(self) -> typing.Optional[str]:
+        return self.topic
+
     def attributes(self):
         attributes = {"brokers": self.brokers or self.bootstrap_servers}
         if self.kwargs_public:
@@ -123,7 +184,7 @@ class DatastoreProfileKafkaTarget(DatastoreProfile):
 
 
 class DatastoreProfileKafkaSource(DatastoreProfile):
-    type: str = pydantic.Field("kafka_source")
+    type: str = pydantic.v1.Field("kafka_source")
     _private_attributes = ("kwargs_private", "sasl_user", "sasl_pass")
     brokers: typing.Union[str, list[str]]
     topics: typing.Union[str, list[str]]
@@ -135,7 +196,11 @@ class DatastoreProfileKafkaSource(DatastoreProfile):
     kwargs_public: typing.Optional[dict]
     kwargs_private: typing.Optional[dict]
 
-    def attributes(self):
+    def get_topic(self) -> typing.Optional[str]:
+        topics = [self.topics] if isinstance(self.topics, str) else self.topics
+        return topics[0] if topics else None
+
+    def attributes(self) -> dict[str, typing.Any]:
         attributes = {}
         if self.kwargs_public:
             attributes = merge(attributes, self.kwargs_public)
@@ -151,18 +216,15 @@ class DatastoreProfileKafkaSource(DatastoreProfile):
         attributes["initial_offset"] = self.initial_offset
         if self.partitions is not None:
             attributes["partitions"] = self.partitions
-        sasl = attributes.pop("sasl", {})
-        if self.sasl_user and self.sasl_pass:
-            sasl["enabled"] = True
-            sasl["user"] = self.sasl_user
-            sasl["password"] = self.sasl_pass
-        if sasl:
+        if sasl := mlrun.datastore.utils.KafkaParameters(attributes).sasl(
+            usr=self.sasl_user, pwd=self.sasl_pass
+        ):
             attributes["sasl"] = sasl
         return attributes
 
 
 class DatastoreProfileV3io(DatastoreProfile):
-    type: str = pydantic.Field("v3io")
+    type: str = pydantic.v1.Field("v3io")
     v3io_access_key: typing.Optional[str] = None
     _private_attributes = "v3io_access_key"
 
@@ -178,7 +240,7 @@ class DatastoreProfileV3io(DatastoreProfile):
 
 
 class DatastoreProfileS3(DatastoreProfile):
-    type: str = pydantic.Field("s3")
+    type: str = pydantic.v1.Field("s3")
     _private_attributes = ("access_key_id", "secret_key")
     endpoint_url: typing.Optional[str] = None
     force_non_anonymous: typing.Optional[str] = None
@@ -188,7 +250,7 @@ class DatastoreProfileS3(DatastoreProfile):
     secret_key: typing.Optional[str] = None
     bucket: typing.Optional[str] = None
 
-    @pydantic.validator("bucket")
+    @pydantic.v1.validator("bucket")
     @classmethod
     def check_bucket(cls, v):
         if not v:
@@ -226,7 +288,7 @@ class DatastoreProfileS3(DatastoreProfile):
 
 
 class DatastoreProfileRedis(DatastoreProfile):
-    type: str = pydantic.Field("redis")
+    type: str = pydantic.v1.Field("redis")
     _private_attributes = ("username", "password")
     endpoint_url: str
     username: typing.Optional[str] = None
@@ -254,7 +316,7 @@ class DatastoreProfileRedis(DatastoreProfile):
             query=parsed_url.query,
             fragment=parsed_url.fragment,
         )
-        return urlunparse(new_parsed_url)
+        return new_parsed_url.geturl()
 
     def secrets(self) -> dict:
         res = {}
@@ -269,7 +331,7 @@ class DatastoreProfileRedis(DatastoreProfile):
 
 
 class DatastoreProfileDBFS(DatastoreProfile):
-    type: str = pydantic.Field("dbfs")
+    type: str = pydantic.v1.Field("dbfs")
     _private_attributes = ("token",)
     endpoint_url: typing.Optional[str] = None  # host
     token: typing.Optional[str] = None
@@ -287,13 +349,13 @@ class DatastoreProfileDBFS(DatastoreProfile):
 
 
 class DatastoreProfileGCS(DatastoreProfile):
-    type: str = pydantic.Field("gcs")
+    type: str = pydantic.v1.Field("gcs")
     _private_attributes = ("gcp_credentials",)
     credentials_path: typing.Optional[str] = None  # path to file.
     gcp_credentials: typing.Optional[typing.Union[str, dict]] = None
     bucket: typing.Optional[str] = None
 
-    @pydantic.validator("bucket")
+    @pydantic.v1.validator("bucket")
     @classmethod
     def check_bucket(cls, v):
         if not v:
@@ -304,7 +366,7 @@ class DatastoreProfileGCS(DatastoreProfile):
             )
         return v
 
-    @pydantic.validator("gcp_credentials", pre=True, always=True)
+    @pydantic.v1.validator("gcp_credentials", pre=True, always=True)
     @classmethod
     def convert_dict_to_json(cls, v):
         if isinstance(v, dict):
@@ -332,7 +394,7 @@ class DatastoreProfileGCS(DatastoreProfile):
 
 
 class DatastoreProfileAzureBlob(DatastoreProfile):
-    type: str = pydantic.Field("az")
+    type: str = pydantic.v1.Field("az")
     _private_attributes = (
         "connection_string",
         "account_key",
@@ -350,7 +412,7 @@ class DatastoreProfileAzureBlob(DatastoreProfile):
     credential: typing.Optional[str] = None
     container: typing.Optional[str] = None
 
-    @pydantic.validator("container")
+    @pydantic.v1.validator("container")
     @classmethod
     def check_container(cls, v):
         if not v:
@@ -392,7 +454,7 @@ class DatastoreProfileAzureBlob(DatastoreProfile):
 
 
 class DatastoreProfileHdfs(DatastoreProfile):
-    type: str = pydantic.Field("hdfs")
+    type: str = pydantic.v1.Field("hdfs")
     _private_attributes = "token"
     host: typing.Optional[str] = None
     port: typing.Optional[int] = None
@@ -415,7 +477,60 @@ class DatastoreProfileHdfs(DatastoreProfile):
         return f"webhdfs://{self.host}:{self.http_port}{subpath}"
 
 
-class DatastoreProfile2Json(pydantic.BaseModel):
+class TDEngineDatastoreProfile(DatastoreProfile):
+    """
+    A profile that holds the required parameters for a TDEngine database, with the websocket scheme.
+    https://docs.tdengine.com/developer-guide/connecting-to-tdengine/#websocket-connection
+    """
+
+    type: str = pydantic.v1.Field("taosws")
+    _private_attributes = ["password"]
+    user: str
+    # The password cannot be empty in real world scenarios. It's here just because of the profiles completion design.
+    password: typing.Optional[str]
+    host: str
+    port: int
+
+    def dsn(self) -> str:
+        """Get the Data Source Name of the configured TDEngine profile."""
+        return f"{self.type}://{self.user}:{self.password}@{self.host}:{self.port}"
+
+    @classmethod
+    def from_dsn(cls, dsn: str, profile_name: str) -> "TDEngineDatastoreProfile":
+        """
+        Construct a TDEngine profile from DSN (connection string) and a name for the profile.
+
+        :param dsn:          The DSN (Data Source Name) of the TDEngine database, e.g.: ``"taosws://root:taosdata@localhost:6041"``.
+        :param profile_name: The new profile's name.
+        :return:             The TDEngine profile.
+        """
+        parsed_url = urlparse(dsn)
+        return cls(
+            name=profile_name,
+            user=parsed_url.username,
+            password=parsed_url.password,
+            host=parsed_url.hostname,
+            port=parsed_url.port,
+        )
+
+
+_DATASTORE_TYPE_TO_PROFILE_CLASS: dict[str, type[DatastoreProfile]] = {
+    "v3io": DatastoreProfileV3io,
+    "s3": DatastoreProfileS3,
+    "redis": DatastoreProfileRedis,
+    "basic": DatastoreProfileBasic,
+    "kafka_target": DatastoreProfileKafkaTarget,
+    "kafka_source": DatastoreProfileKafkaSource,
+    "dbfs": DatastoreProfileDBFS,
+    "gcs": DatastoreProfileGCS,
+    "az": DatastoreProfileAzureBlob,
+    "hdfs": DatastoreProfileHdfs,
+    "taosws": TDEngineDatastoreProfile,
+    "config": ConfigProfile,
+}
+
+
+class DatastoreProfile2Json(pydantic.v1.BaseModel):
     @staticmethod
     def _to_json(attributes):
         # First, base64 encode the values
@@ -465,18 +580,7 @@ class DatastoreProfile2Json(pydantic.BaseModel):
 
         decoded_dict = {k: safe_literal_eval(v) for k, v in decoded_dict.items()}
         datastore_type = decoded_dict.get("type")
-        ds_profile_factory = {
-            "v3io": DatastoreProfileV3io,
-            "s3": DatastoreProfileS3,
-            "redis": DatastoreProfileRedis,
-            "basic": DatastoreProfileBasic,
-            "kafka_target": DatastoreProfileKafkaTarget,
-            "kafka_source": DatastoreProfileKafkaSource,
-            "dbfs": DatastoreProfileDBFS,
-            "gcs": DatastoreProfileGCS,
-            "az": DatastoreProfileAzureBlob,
-            "hdfs": DatastoreProfileHdfs,
-        }
+        ds_profile_factory = _DATASTORE_TYPE_TO_PROFILE_CLASS
         if datastore_type in ds_profile_factory:
             return ds_profile_factory[datastore_type].parse_obj(decoded_dict)
         else:
@@ -489,7 +593,36 @@ class DatastoreProfile2Json(pydantic.BaseModel):
             )
 
 
-def datastore_profile_read(url, project_name="", secrets: dict = None):
+def datastore_profile_read(url, project_name="", secrets: typing.Optional[dict] = None):
+    """
+    Read and retrieve a datastore profile from a given URL.
+
+    This function retrieves a datastore profile either from temporary client storage,
+    or from the MLRun database. It handles both client-side and server-side profile formats
+    and performs necessary conversions.
+
+    Args:
+        url (str): A URL with 'ds' scheme pointing to the datastore profile
+            (e.g., 'ds://profile-name').
+        project_name (str, optional): The project name where the profile is stored.
+            Defaults to MLRun's default project.
+        secrets (dict, optional): Dictionary containing secrets needed for profile retrieval.
+
+    Returns:
+        DatastoreProfile: The retrieved datastore profile object.
+
+    Raises:
+        MLRunInvalidArgumentError: In the following cases:
+            - If the URL scheme is not 'ds'
+            - If the profile cannot be retrieved from either server or local environment
+
+    Note:
+       When running from a client environment (outside MLRun pods), private profile information
+       is not accessible. In this case, use register_temporary_client_datastore_profile() to
+       register the profile with credentials for your local session. When running inside MLRun
+       pods, the private information is automatically available and no temporary registration is needed.
+    """
+
     parsed_url = urlparse(url)
     if parsed_url.scheme.lower() != "ds":
         raise mlrun.errors.MLRunInvalidArgumentError(
@@ -521,7 +654,7 @@ def datastore_profile_read(url, project_name="", secrets: dict = None):
     )
     private_body = get_secret_or_env(project_ds_name_private, secret_provider=secrets)
     if not public_profile or not private_body:
-        raise mlrun.errors.MLRunInvalidArgumentError(
+        raise mlrun.errors.MLRunNotFoundError(
             f"Unable to retrieve the datastore profile '{url}' from either the server or local environment. "
             "Make sure the profile is registered correctly, or if running in a local environment, "
             "use register_temporary_client_datastore_profile() to provide credentials locally."

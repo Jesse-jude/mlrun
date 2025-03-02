@@ -43,7 +43,7 @@ prep_data_run = data_prep_func.run(
 
 To call the function with an `input` you can use the `inputs` dictionary attribute. To pass
 a simple parameter, use the `params` dictionary attribute. The input value is the specific item uri
-(per data store schema) as explained in [Shared data stores](../store/datastore.html#shared-data-stores).
+(per data store schema) as explained in [Shared data stores](../store/datastore.md).
 
 From v1.3, `DataItem` objects are automatically parsed to the hinted type when a type hint is available.
 
@@ -61,7 +61,7 @@ The {py:class}`~mlrun.datastore.DataItem` supports multiple convenience methods 
 * **local** - to get a local file link to the data (that is downloaded locally if needed)
 * **listdir()**, **stat** - file system like methods
 * **meta** - access to the artifact metadata (in case of an artifact uri)
-* **show()** - visualizes the data in Jupyter (as image, html, etc.)
+* **show()** - visualizes the data in Jupyter (as image, HTML, etc.)
 
 See the **{py:class}`~mlrun.datastore.DataItem`** class documentation for details.
 

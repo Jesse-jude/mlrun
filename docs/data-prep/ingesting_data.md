@@ -51,8 +51,9 @@ This code can be placed in a python file, or as a cell in the Python notebook. F
 to a file, the following code creates an MLRun function from it and executes it remotely in a pod:
 
 ```python
-# create a function from py or notebook (ipynb) file, specify the default function handler
-ingest_func = mlrun.code_to_function(
+# create a project, then a function from py or notebook (ipynb) file, specify the default function handler
+project = mlrun.get_or_create_project("ingest-data")
+ingest_func = project.set_function(
     name="ingest_data", filename="./ingest_data.py", kind="job", image="mlrun/mlrun"
 )
 
@@ -88,7 +89,7 @@ facilities for executing pySpark code using a Spark service (which can be deploy
 as part of an Iguazio system) or through submitting the processing task to Spark-operator. The following page provides
 additional details and code-samples:
 
-- [Spark operator](../runtimes/spark-operator.html)
+- [Spark operator](../runtimes/spark-operator.ipynb)
 
 In a similar manner, Dask can be used for parallel processing of the data. To read data as a Dask `DataFrame`, use the
 following code:

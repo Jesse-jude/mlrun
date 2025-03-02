@@ -15,9 +15,8 @@
 import enum
 import typing
 
-import mlrun_pipelines.common.models
-
 import mlrun.common.constants as mlrun_constants
+import mlrun_pipelines.common.models
 
 
 class PodPhases:
@@ -196,6 +195,10 @@ class RunStates:
         ]
 
     @staticmethod
+    def notification_states():
+        return RunStates.terminal_states() + [RunStates.running]
+
+    @staticmethod
     def run_state_to_pipeline_run_status(run_state: str):
         if not run_state:
             return mlrun_pipelines.common.models.RunStatuses.runtime_state_unspecified
@@ -214,6 +217,24 @@ class RunStates:
             RunStates.aborting: mlrun_pipelines.common.models.RunStatuses.canceling,
             RunStates.skipped: mlrun_pipelines.common.models.RunStatuses.skipped,
         }[run_state]
+
+    @staticmethod
+    def pipeline_run_status_to_run_state(pipeline_run_status):
+        if pipeline_run_status not in mlrun_pipelines.common.models.RunStatuses.all():
+            raise ValueError(f"Invalid pipeline run status: {pipeline_run_status}")
+        return {
+            mlrun_pipelines.common.models.RunStatuses.succeeded: RunStates.completed,
+            mlrun_pipelines.common.models.RunStatuses.failed: RunStates.error,
+            mlrun_pipelines.common.models.RunStatuses.running: RunStates.running,
+            mlrun_pipelines.common.models.RunStatuses.pending: RunStates.pending,
+            mlrun_pipelines.common.models.RunStatuses.canceled: RunStates.aborted,
+            mlrun_pipelines.common.models.RunStatuses.canceling: RunStates.aborting,
+            mlrun_pipelines.common.models.RunStatuses.skipped: RunStates.skipped,
+            mlrun_pipelines.common.models.RunStatuses.runtime_state_unspecified: RunStates.unknown,
+            mlrun_pipelines.common.models.RunStatuses.error: RunStates.error,
+            mlrun_pipelines.common.models.RunStatuses.paused: RunStates.unknown,
+            mlrun_pipelines.common.models.RunStatuses.unknown: RunStates.unknown,
+        }[pipeline_run_status]
 
 
 # TODO: remove this class in 1.9.0 - use only MlrunInternalLabels

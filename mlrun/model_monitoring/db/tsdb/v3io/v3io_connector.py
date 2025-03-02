@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from datetime import datetime
+import asyncio
+import math
+from datetime import datetime, timedelta, timezone
 from io import StringIO
-from typing import Literal, Optional, Union
+from typing import Callable, Literal, Optional, Union
 
 import pandas as pd
 import v3io_frames
@@ -24,6 +25,7 @@ import mlrun.common.model_monitoring
 import mlrun.common.schemas.model_monitoring as mm_schemas
 import mlrun.feature_store.steps
 import mlrun.utils.v3io_clients
+from mlrun.common.schemas import EventFieldType
 from mlrun.model_monitoring.db import TSDBConnector
 from mlrun.model_monitoring.helpers import get_invocations_fqn
 from mlrun.utils import logger
@@ -32,8 +34,10 @@ _TSDB_BE = "tsdb"
 _TSDB_RATE = "1/s"
 _CONTAINER = "users"
 
+V3IO_MEPS_LIMIT = 200
 
-def _is_no_schema_error(exc: v3io_frames.ReadError) -> bool:
+
+def _is_no_schema_error(exc: v3io_frames.Error) -> bool:
     """
     In case of a nonexistent TSDB table - a `v3io_frames.ReadError` error is raised.
     Check if the error message contains the relevant string to verify the cause.
@@ -57,6 +61,7 @@ class V3IOTSDBConnector(TSDBConnector):
         project: str,
         container: str = _CONTAINER,
         v3io_framesd: Optional[str] = None,
+        v3io_access_key: str = "",
         create_table: bool = False,
     ) -> None:
         super().__init__(project=project)
@@ -64,14 +69,20 @@ class V3IOTSDBConnector(TSDBConnector):
         self.container = container
 
         self.v3io_framesd = v3io_framesd or mlrun.mlconf.v3io_framesd
-        self._frames_client: v3io_frames.client.ClientBase = (
-            self._get_v3io_frames_client(self.container)
-        )
-
+        self._v3io_access_key = v3io_access_key
+        self._frames_client: Optional[v3io_frames.client.ClientBase] = None
         self._init_tables_path()
+        self._create_table = create_table
 
-        if create_table:
-            self.create_tables()
+    @property
+    def frames_client(self) -> v3io_frames.client.ClientBase:
+        if not self._frames_client:
+            self._frames_client = self._get_v3io_frames_client(
+                self.container, v3io_access_key=self._v3io_access_key
+            )
+            if self._create_table:
+                self.create_tables()
+        return self._frames_client
 
     def _init_tables_path(self):
         self.tables = {}
@@ -88,6 +99,19 @@ class V3IOTSDBConnector(TSDBConnector):
             events_table_full_path
         )
         self.tables[mm_schemas.V3IOTSDBTables.EVENTS] = events_path
+
+        errors_table_full_path = mlrun.mlconf.get_model_monitoring_file_target_path(
+            project=self.project,
+            kind=mm_schemas.FileTargetKind.ERRORS,
+        )
+        (
+            _,
+            _,
+            errors_path,
+        ) = mlrun.common.model_monitoring.helpers.parse_model_endpoint_store_prefix(
+            errors_table_full_path
+        )
+        self.tables[mm_schemas.V3IOTSDBTables.ERRORS] = errors_path
 
         monitoring_application_full_path = (
             mlrun.mlconf.get_model_monitoring_file_target_path(
@@ -112,7 +136,7 @@ class V3IOTSDBConnector(TSDBConnector):
         monitoring_predictions_full_path = (
             mlrun.mlconf.get_model_monitoring_file_target_path(
                 project=self.project,
-                kind=mm_schemas.FileTargetKind.PREDICTIONS,
+                kind=mm_schemas.V3IOTSDBTables.PREDICTIONS,
             )
         )
         (
@@ -122,7 +146,7 @@ class V3IOTSDBConnector(TSDBConnector):
         ) = mlrun.common.model_monitoring.helpers.parse_model_endpoint_store_prefix(
             monitoring_predictions_full_path
         )
-        self.tables[mm_schemas.FileTargetKind.PREDICTIONS] = monitoring_predictions_path
+        self.tables[mm_schemas.V3IOTSDBTables.PREDICTIONS] = monitoring_predictions_path
 
     def create_tables(self) -> None:
         """
@@ -138,7 +162,7 @@ class V3IOTSDBConnector(TSDBConnector):
         for table_name in application_tables:
             logger.info("Creating table in V3IO TSDB", table_name=table_name)
             table = self.tables[table_name]
-            self._frames_client.create(
+            self.frames_client.create(
                 backend=_TSDB_BE,
                 table=table,
                 if_exists=v3io_frames.IGNORE,
@@ -148,8 +172,12 @@ class V3IOTSDBConnector(TSDBConnector):
     def apply_monitoring_stream_steps(
         self,
         graph,
-        tsdb_batching_max_events: int = 10,
-        tsdb_batching_timeout_secs: int = 300,
+        tsdb_batching_max_events: int = 1000,
+        tsdb_batching_timeout_secs: int = 30,
+        sample_window: int = 10,
+        aggregate_windows: Optional[list[str]] = None,
+        aggregate_period: str = "1m",
+        **kwarg,
     ):
         """
         Apply TSDB steps on the provided monitoring graph. Throughout these steps, the graph stores live data of
@@ -160,18 +188,56 @@ class V3IOTSDBConnector(TSDBConnector):
         - endpoint_features (Prediction and feature names and values)
         - custom_metrics (user-defined metrics)
         """
+        aggregate_windows = aggregate_windows or ["5m", "1h"]
 
+        # Calculate number of predictions and average latency
+        def apply_storey_aggregations():
+            # Calculate number of predictions for each window (5 min and 1 hour by default)
+            graph.add_step(
+                class_name="storey.AggregateByKey",
+                aggregates=[
+                    {
+                        "name": EventFieldType.LATENCY,
+                        "column": EventFieldType.LATENCY,
+                        "operations": ["count", "avg"],
+                        "windows": aggregate_windows,
+                        "period": aggregate_period,
+                    }
+                ],
+                name=EventFieldType.LATENCY,
+                after="FilterNOP",
+                step_name="Aggregates",
+                table=".",
+                key_field=EventFieldType.ENDPOINT_ID,
+            )
+            # Calculate average latency time for each window (5 min and 1 hour by default)
+            graph.add_step(
+                class_name="storey.Rename",
+                mapping={
+                    "latency_count_5m": mm_schemas.EventLiveStats.PREDICTIONS_COUNT_5M,
+                    "latency_count_1h": mm_schemas.EventLiveStats.PREDICTIONS_COUNT_1H,
+                },
+                name="Rename",
+                after=EventFieldType.LATENCY,
+            )
+
+        apply_storey_aggregations()
         # Write latency per prediction, labeled by endpoint ID only
         graph.add_step(
             "storey.TSDBTarget",
             name="tsdb_predictions",
-            after="MapFeatureNames",
-            path=f"{self.container}/{self.tables[mm_schemas.FileTargetKind.PREDICTIONS]}",
+            after="FilterNOP",
+            path=f"{self.container}/{self.tables[mm_schemas.V3IOTSDBTables.PREDICTIONS]}",
             rate="1/s",
             time_col=mm_schemas.EventFieldType.TIMESTAMP,
             container=self.container,
             v3io_frames=self.v3io_framesd,
-            columns=[mm_schemas.EventFieldType.LATENCY],
+            columns=[
+                mm_schemas.EventFieldType.LATENCY,
+                mm_schemas.EventFieldType.LAST_REQUEST_TIMESTAMP,
+                mm_schemas.EventFieldType.ESTIMATED_PREDICTION_COUNT,
+                mm_schemas.EventFieldType.EFFECTIVE_SAMPLE_COUNT,
+            ],
             index_cols=[
                 mm_schemas.EventFieldType.ENDPOINT_ID,
             ],
@@ -182,17 +248,23 @@ class V3IOTSDBConnector(TSDBConnector):
             key=mm_schemas.EventFieldType.ENDPOINT_ID,
         )
 
+        # Emits the event in window size of events based on sample_window size (10 by default)
+        graph.add_step(
+            "storey.steps.SampleWindow",
+            name="sample",
+            after="Rename",
+            window_size=sample_window,
+            key=EventFieldType.ENDPOINT_ID,
+        )
+
         # Before writing data to TSDB, create dictionary of 2-3 dictionaries that contains
         # stats and details about the events
 
-        def apply_process_before_tsdb():
-            graph.add_step(
-                "mlrun.model_monitoring.db.tsdb.v3io.stream_graph_steps.ProcessBeforeTSDB",
-                name="ProcessBeforeTSDB",
-                after="sample",
-            )
-
-        apply_process_before_tsdb()
+        graph.add_step(
+            "mlrun.model_monitoring.db.tsdb.v3io.stream_graph_steps.ProcessBeforeTSDB",
+            name="ProcessBeforeTSDB",
+            after="sample",
+        )
 
         # Unpacked keys from each dictionary and write to TSDB target
         def apply_filter_and_unpacked_keys(name, keys):
@@ -255,6 +327,41 @@ class V3IOTSDBConnector(TSDBConnector):
         apply_storey_filter()
         apply_tsdb_target(name="tsdb3", after="FilterNotNone")
 
+    def handle_model_error(
+        self,
+        graph,
+        tsdb_batching_max_events: int = 1000,
+        tsdb_batching_timeout_secs: int = 30,
+        **kwargs,
+    ) -> None:
+        graph.add_step(
+            "mlrun.model_monitoring.db.tsdb.v3io.stream_graph_steps.ErrorExtractor",
+            name="error_extractor",
+            after="ForwardError",
+        )
+
+        graph.add_step(
+            "storey.TSDBTarget",
+            name="tsdb_error",
+            after="error_extractor",
+            path=f"{self.container}/{self.tables[mm_schemas.FileTargetKind.ERRORS]}",
+            rate="1/s",
+            time_col=mm_schemas.EventFieldType.TIMESTAMP,
+            container=self.container,
+            v3io_frames=self.v3io_framesd,
+            columns=[
+                mm_schemas.EventFieldType.MODEL_ERROR,
+                mm_schemas.EventFieldType.ERROR_COUNT,
+            ],
+            index_cols=[
+                mm_schemas.EventFieldType.ENDPOINT_ID,
+                mm_schemas.EventFieldType.ERROR_TYPE,
+            ],
+            max_events=tsdb_batching_max_events,
+            flush_after_seconds=tsdb_batching_timeout_secs,
+            key=mm_schemas.EventFieldType.ENDPOINT_ID,
+        )
+
     def write_application_event(
         self,
         event: dict,
@@ -277,12 +384,11 @@ class V3IOTSDBConnector(TSDBConnector):
         elif kind == mm_schemas.WriterEventKind.RESULT:
             table = self.tables[mm_schemas.V3IOTSDBTables.APP_RESULTS]
             index_cols = index_cols_base + [mm_schemas.ResultData.RESULT_NAME]
-            del event[mm_schemas.ResultData.RESULT_EXTRA_DATA]
         else:
             raise ValueError(f"Invalid {kind = }")
 
         try:
-            self._frames_client.write(
+            self.frames_client.write(
                 backend=_TSDB_BE,
                 table=table,
                 dfs=pd.DataFrame.from_records([event]),
@@ -309,7 +415,7 @@ class V3IOTSDBConnector(TSDBConnector):
             tables = mm_schemas.V3IOTSDBTables.list()
         for table_to_delete in tables:
             try:
-                self._frames_client.delete(backend=_TSDB_BE, table=table_to_delete)
+                self.frames_client.delete(backend=_TSDB_BE, table=table_to_delete)
             except v3io_frames.DeleteError as e:
                 logger.warning(
                     f"Failed to delete TSDB table '{table}'",
@@ -386,8 +492,9 @@ class V3IOTSDBConnector(TSDBConnector):
         interval: Optional[str] = None,
         agg_funcs: Optional[list[str]] = None,
         sliding_window_step: Optional[str] = None,
+        get_raw: bool = False,
         **kwargs,
-    ) -> pd.DataFrame:
+    ) -> Union[pd.DataFrame, list[v3io_frames.client.RawFrame]]:
         """
          Getting records from V3IO TSDB data collection.
         :param table:                 Path to the collection to query.
@@ -412,6 +519,10 @@ class V3IOTSDBConnector(TSDBConnector):
                                       `sliding_window_step` is provided, interval must be provided as well. Provided
                                       as a string in the format of '1m', '1h', etc.
         :param kwargs:                Additional keyword arguments passed to the read method of frames client.
+        :param get_raw:               Whether to return the request as raw frames rather than a pandas dataframe.
+                                      Defaults to False. This can greatly improve performance when a dataframe isn't
+                                      needed.
+
         :return: DataFrame with the provided attributes from the data collection.
         :raise:  MLRunNotFoundError if the provided table wasn't found.
         """
@@ -425,7 +536,7 @@ class V3IOTSDBConnector(TSDBConnector):
         aggregators = ",".join(agg_funcs) if agg_funcs else None
         table_path = self.tables[table]
         try:
-            df = self._frames_client.read(
+            res = self.frames_client.read(
                 backend=_TSDB_BE,
                 table=table_path,
                 start=start,
@@ -435,15 +546,18 @@ class V3IOTSDBConnector(TSDBConnector):
                 aggregation_window=interval,
                 aggregators=aggregators,
                 step=sliding_window_step,
+                get_raw=get_raw,
                 **kwargs,
             )
-        except v3io_frames.ReadError as err:
+            if get_raw:
+                res = list(res)
+        except v3io_frames.Error as err:
             if _is_no_schema_error(err):
-                return pd.DataFrame()
+                return [] if get_raw else pd.DataFrame()
             else:
                 raise err
 
-        return df
+        return res
 
     def _get_v3io_source_directory(self) -> str:
         """
@@ -467,11 +581,33 @@ class V3IOTSDBConnector(TSDBConnector):
         return source_directory
 
     @staticmethod
-    def _get_v3io_frames_client(v3io_container: str) -> v3io_frames.client.ClientBase:
+    def _get_v3io_frames_client(
+        v3io_container: str, v3io_access_key: str = ""
+    ) -> v3io_frames.client.ClientBase:
         return mlrun.utils.v3io_clients.get_frames_client(
             address=mlrun.mlconf.v3io_framesd,
             container=v3io_container,
+            token=v3io_access_key,
         )
+
+    @staticmethod
+    def _get_endpoint_filter(endpoint_id: Union[str, list[str]]) -> Optional[str]:
+        if isinstance(endpoint_id, str):
+            return f"endpoint_id=='{endpoint_id}'"
+        elif isinstance(endpoint_id, list):
+            if len(endpoint_id) > V3IO_MEPS_LIMIT:
+                logger.info(
+                    "The number of endpoint ids exceeds the v3io-engine filter-expression limit, "
+                    "retrieving all the model endpoints from the db.",
+                    limit=V3IO_MEPS_LIMIT,
+                    amount=len(endpoint_id),
+                )
+                return None
+            return f"endpoint_id IN({str(endpoint_id)[1:-1]}) "
+        else:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"Invalid 'endpoint_id' filter: must be a string or a list, endpoint_id: {endpoint_id}"
+            )
 
     def read_metrics_data(
         self,
@@ -481,6 +617,7 @@ class V3IOTSDBConnector(TSDBConnector):
         end: datetime,
         metrics: list[mm_schemas.ModelEndpointMonitoringMetric],
         type: Literal["metrics", "results"] = "results",
+        with_result_extra_data: bool = False,
     ) -> Union[
         list[
             Union[
@@ -502,12 +639,26 @@ class V3IOTSDBConnector(TSDBConnector):
         """
 
         if type == "metrics":
+            if with_result_extra_data:
+                logger.warning(
+                    "The 'with_result_extra_data' parameter is not supported for metrics, just for results",
+                    project=self.project,
+                    endpoint_id=endpoint_id,
+                )
             table_path = self.tables[mm_schemas.V3IOTSDBTables.METRICS]
             name = mm_schemas.MetricData.METRIC_NAME
+            columns = [mm_schemas.MetricData.METRIC_VALUE]
             df_handler = self.df_to_metrics_values
         elif type == "results":
             table_path = self.tables[mm_schemas.V3IOTSDBTables.APP_RESULTS]
             name = mm_schemas.ResultData.RESULT_NAME
+            columns = [
+                mm_schemas.ResultData.RESULT_VALUE,
+                mm_schemas.ResultData.RESULT_STATUS,
+                mm_schemas.ResultData.RESULT_KIND,
+            ]
+            if with_result_extra_data:
+                columns.append(mm_schemas.ResultData.RESULT_EXTRA_DATA)
             df_handler = self.df_to_results_values
         else:
             raise ValueError(f"Invalid {type = }")
@@ -517,11 +668,12 @@ class V3IOTSDBConnector(TSDBConnector):
             metric_and_app_names=[(metric.app, metric.name) for metric in metrics],
             table_path=table_path,
             name=name,
+            columns=columns,
         )
 
         logger.debug("Querying V3IO TSDB", query=query)
 
-        df: pd.DataFrame = self._frames_client.read(
+        df: pd.DataFrame = self.frames_client.read(
             backend=_TSDB_BE,
             start=start,
             end=end,
@@ -535,6 +687,9 @@ class V3IOTSDBConnector(TSDBConnector):
             endpoint_id=endpoint_id,
             is_empty=df.empty,
         )
+        if not with_result_extra_data and type == "results":
+            # Set the extra data to an empty string if it's not requested
+            df[mm_schemas.ResultData.RESULT_EXTRA_DATA] = ""
 
         return df_handler(df=df, metrics=metrics, project=self.project)
 
@@ -594,10 +749,10 @@ class V3IOTSDBConnector(TSDBConnector):
                 "both or neither of `aggregation_window` and `agg_funcs` must be provided"
             )
         df = self._get_records(
-            table=mm_schemas.FileTargetKind.PREDICTIONS,
+            table=mm_schemas.V3IOTSDBTables.PREDICTIONS,
             start=start,
             end=end,
-            columns=[mm_schemas.EventFieldType.LATENCY],
+            columns=[mm_schemas.EventFieldType.ESTIMATED_PREDICTION_COUNT],
             filter_query=f"endpoint_id=='{endpoint_id}'",
             agg_funcs=agg_funcs,
             sliding_window_step=aggregation_window,
@@ -611,10 +766,10 @@ class V3IOTSDBConnector(TSDBConnector):
                 type=mm_schemas.ModelEndpointMonitoringMetricType.METRIC,
             )
 
-        latency_column = (
-            f"{agg_funcs[0]}({mm_schemas.EventFieldType.LATENCY})"
+        estimated_prediction_count = (
+            f"{agg_funcs[0]}({mm_schemas.EventFieldType.ESTIMATED_PREDICTION_COUNT})"
             if agg_funcs
-            else mm_schemas.EventFieldType.LATENCY
+            else mm_schemas.EventFieldType.ESTIMATED_PREDICTION_COUNT
         )
 
         return mm_schemas.ModelEndpointMonitoringMetricValues(
@@ -622,38 +777,287 @@ class V3IOTSDBConnector(TSDBConnector):
             values=list(
                 zip(
                     df.index,
-                    df[latency_column],
+                    df[estimated_prediction_count],
                 )
             ),  # pyright: ignore[reportArgumentType]
         )
 
-    # Note: this function serves as a reference for checking the TSDB for the existence of a metric.
-    #
-    # def read_prediction_metric_for_endpoint_if_exists(
-    #     self, endpoint_id: str
-    # ) -> Optional[mm_schemas.ModelEndpointMonitoringMetric]:
-    #     """
-    #     Read the count of the latency column in the predictions table for the given endpoint_id.
-    #     We just want to check if there is any data for this endpoint_id.
-    #     """
-    #     query = self._get_sql_query(
-    #         endpoint_id=endpoint_id,
-    #         table_path=self.tables[mm_schemas.FileTargetKind.PREDICTIONS],
-    #         columns=[f"count({mm_schemas.EventFieldType.LATENCY})"],
-    #     )
-    #     try:
-    #         logger.debug("Checking TSDB", project=self.project, query=query)
-    #         df: pd.DataFrame = self._frames_client.read(
-    #             backend=_TSDB_BE, query=query, start="0", end="now"
-    #         )
-    #     except v3io_frames.ReadError as err:
-    #         if _is_no_schema_error(err):
-    #             logger.debug(
-    #                 "No predictions yet", project=self.project, endpoint_id=endpoint_id
-    #             )
-    #             return
-    #         else:
-    #             raise
-    #
-    #     if not df.empty:
-    #         return get_invocations_metric(self.project)
+    def get_last_request(
+        self,
+        endpoint_ids: Union[str, list[str]],
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        get_raw: bool = False,
+    ) -> Union[pd.DataFrame, list[v3io_frames.client.RawFrame]]:
+        filter_query = self._get_endpoint_filter(endpoint_id=endpoint_ids)
+        start, end = self._get_start_end(start, end)
+        res = self._get_records(
+            table=mm_schemas.V3IOTSDBTables.PREDICTIONS,
+            start=start,
+            end=end,
+            filter_query=filter_query,
+            agg_funcs=["last"],
+            get_raw=get_raw,
+        )
+
+        if get_raw:
+            return res
+
+        df = res
+        if not df.empty:
+            df.rename(
+                columns={
+                    f"last({mm_schemas.EventFieldType.LAST_REQUEST_TIMESTAMP})": mm_schemas.EventFieldType.LAST_REQUEST,
+                    f"last({mm_schemas.EventFieldType.LATENCY})": f"last_{mm_schemas.EventFieldType.LATENCY}",
+                },
+                inplace=True,
+            )
+            df[mm_schemas.EventFieldType.LAST_REQUEST] = df[
+                mm_schemas.EventFieldType.LAST_REQUEST
+            ].map(
+                lambda last_request: datetime.fromtimestamp(
+                    last_request, tz=timezone.utc
+                )
+            )
+
+        return df.reset_index(drop=True)
+
+    def get_drift_status(
+        self,
+        endpoint_ids: Union[str, list[str]],
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        get_raw: bool = False,
+    ) -> Union[pd.DataFrame, list[v3io_frames.client.RawFrame]]:
+        filter_query = self._get_endpoint_filter(endpoint_id=endpoint_ids)
+        start = start or (mlrun.utils.datetime_now() - timedelta(hours=24))
+        start, end = self._get_start_end(start, end)
+        res = self._get_records(
+            table=mm_schemas.V3IOTSDBTables.APP_RESULTS,
+            start=start,
+            end=end,
+            columns=[mm_schemas.ResultData.RESULT_STATUS],
+            filter_query=filter_query,
+            agg_funcs=["max"],
+            group_by="endpoint_id",
+            get_raw=get_raw,
+        )
+        if get_raw:
+            return res
+
+        df = res
+        if not df.empty:
+            df.columns = [
+                col[len("max(") : -1] if "max(" in col else col for col in df.columns
+            ]
+        return df.reset_index(drop=True)
+
+    def get_metrics_metadata(
+        self,
+        endpoint_id: Union[str, list[str]],
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> pd.DataFrame:
+        start, end = self._get_start_end(start, end)
+        filter_query = self._get_endpoint_filter(endpoint_id=endpoint_id)
+        df = self._get_records(
+            table=mm_schemas.V3IOTSDBTables.METRICS,
+            start=start,
+            end=end,
+            columns=[mm_schemas.MetricData.METRIC_VALUE],
+            filter_query=filter_query,
+            agg_funcs=["last"],
+        )
+        if not df.empty:
+            df.drop(
+                columns=[f"last({mm_schemas.MetricData.METRIC_VALUE})"], inplace=True
+            )
+        return df.reset_index(drop=True)
+
+    def get_results_metadata(
+        self,
+        endpoint_id: Union[str, list[str]],
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> pd.DataFrame:
+        start, end = self._get_start_end(start, end)
+        filter_query = self._get_endpoint_filter(endpoint_id=endpoint_id)
+        df = self._get_records(
+            table=mm_schemas.V3IOTSDBTables.APP_RESULTS,
+            start=start,
+            end=end,
+            columns=[
+                mm_schemas.ResultData.RESULT_KIND,
+            ],
+            filter_query=filter_query,
+            agg_funcs=["last"],
+        )
+        if not df.empty:
+            df.rename(
+                columns={
+                    f"last({mm_schemas.ResultData.RESULT_KIND})": mm_schemas.ResultData.RESULT_KIND
+                },
+                inplace=True,
+            )
+        return df.reset_index(drop=True)
+
+    def get_error_count(
+        self,
+        endpoint_ids: Union[str, list[str]],
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        get_raw: bool = False,
+    ) -> Union[pd.DataFrame, list[v3io_frames.client.RawFrame]]:
+        filter_query = self._get_endpoint_filter(endpoint_id=endpoint_ids)
+        if filter_query:
+            filter_query += f"AND {mm_schemas.EventFieldType.ERROR_TYPE} == '{mm_schemas.EventFieldType.INFER_ERROR}'"
+        else:
+            filter_query = f"{mm_schemas.EventFieldType.ERROR_TYPE} == '{mm_schemas.EventFieldType.INFER_ERROR}' z"
+        start, end = self._get_start_end(start, end)
+        res = self._get_records(
+            table=mm_schemas.FileTargetKind.ERRORS,
+            start=start,
+            end=end,
+            columns=[mm_schemas.EventFieldType.ERROR_COUNT],
+            filter_query=filter_query,
+            agg_funcs=["count"],
+            get_raw=get_raw,
+        )
+
+        if get_raw:
+            return res
+
+        df = res
+        if not df.empty:
+            df.rename(
+                columns={
+                    f"count({mm_schemas.EventFieldType.ERROR_COUNT})": mm_schemas.EventFieldType.ERROR_COUNT
+                },
+                inplace=True,
+            )
+            df.dropna(inplace=True)
+        return df.reset_index(drop=True)
+
+    def get_avg_latency(
+        self,
+        endpoint_ids: Union[str, list[str]],
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        get_raw: bool = False,
+    ) -> Union[pd.DataFrame, list[v3io_frames.client.RawFrame]]:
+        filter_query = self._get_endpoint_filter(endpoint_id=endpoint_ids)
+        start = start or (mlrun.utils.datetime_now() - timedelta(hours=24))
+        start, end = self._get_start_end(start, end)
+        res = self._get_records(
+            table=mm_schemas.V3IOTSDBTables.PREDICTIONS,
+            start=start,
+            end=end,
+            columns=[mm_schemas.EventFieldType.LATENCY],
+            filter_query=filter_query,
+            agg_funcs=["avg"],
+            get_raw=get_raw,
+        )
+
+        if get_raw:
+            return res
+
+        df = res
+        if not df.empty:
+            df.dropna(inplace=True)
+            df.rename(
+                columns={
+                    f"avg({mm_schemas.EventFieldType.LATENCY})": f"avg_{mm_schemas.EventFieldType.LATENCY}"
+                },
+                inplace=True,
+            )
+        return df.reset_index(drop=True)
+
+    async def add_basic_metrics(
+        self,
+        model_endpoint_objects: list[mlrun.common.schemas.ModelEndpoint],
+        project: str,
+        run_in_threadpool: Callable,
+    ) -> list[mlrun.common.schemas.ModelEndpoint]:
+        """
+        Fetch basic metrics from V3IO TSDB and add them to MEP objects.
+
+        :param model_endpoint_objects: A list of `ModelEndpoint` objects that will
+                                        be filled with the relevant basic metrics.
+        :param project:                The name of the project.
+        :param run_in_threadpool:      A function that runs another function in a thread pool.
+
+        :return: A list of `ModelEndpointMonitoringMetric` objects.
+        """
+
+        uids = []
+        model_endpoint_objects_by_uid = {}
+        for model_endpoint_object in model_endpoint_objects:
+            uid = model_endpoint_object.metadata.uid
+            uids.append(uid)
+            model_endpoint_objects_by_uid[uid] = model_endpoint_object
+
+        coroutines = [
+            run_in_threadpool(
+                self.get_error_count,
+                endpoint_ids=uids,
+                get_raw=True,
+            ),
+            run_in_threadpool(
+                self.get_last_request,
+                endpoint_ids=uids,
+                get_raw=True,
+            ),
+            run_in_threadpool(
+                self.get_avg_latency,
+                endpoint_ids=uids,
+                get_raw=True,
+            ),
+            run_in_threadpool(
+                self.get_drift_status,
+                endpoint_ids=uids,
+                get_raw=True,
+            ),
+        ]
+
+        (
+            error_count_res,
+            last_request_res,
+            avg_latency_res,
+            drift_status_res,
+        ) = await asyncio.gather(*coroutines)
+
+        def add_metric(
+            metric: str,
+            column_name: str,
+            frames: list,
+        ):
+            for frame in frames:
+                endpoint_ids = frame.column_data("endpoint_id")
+                metric_data = frame.column_data(column_name)
+                for index, endpoint_id in enumerate(endpoint_ids):
+                    mep = model_endpoint_objects_by_uid.get(endpoint_id)
+                    value = metric_data[index]
+                    if mep and value is not None and not math.isnan(value):
+                        setattr(mep.status, metric, value)
+
+        add_metric(
+            "error_count",
+            "count(error_count)",
+            error_count_res,
+        )
+        add_metric(
+            "last_request",
+            "last(last_request_timestamp)",
+            last_request_res,
+        )
+        add_metric(
+            "avg_latency",
+            "max(result_status)",
+            drift_status_res,
+        )
+        add_metric(
+            "result_status",
+            "avg(latency)",
+            avg_latency_res,
+        )
+        return list(model_endpoint_objects_by_uid.values())

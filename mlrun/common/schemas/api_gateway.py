@@ -15,7 +15,7 @@
 import typing
 from typing import Optional
 
-import pydantic
+import pydantic.v1
 
 import mlrun.common.constants as mlrun_constants
 import mlrun.common.types
@@ -49,9 +49,9 @@ class APIGatewayState(mlrun.common.types.StrEnum):
     waiting_for_provisioning = "waitingForProvisioning"
 
 
-class _APIGatewayBaseModel(pydantic.BaseModel):
+class _APIGatewayBaseModel(pydantic.v1.BaseModel):
     class Config:
-        extra = pydantic.Extra.allow
+        extra = pydantic.v1.Extra.allow
 
 
 class APIGatewayMetadata(_APIGatewayBaseModel):
@@ -77,7 +77,7 @@ class APIGatewaySpec(_APIGatewayBaseModel):
     name: str
     description: Optional[str]
     path: Optional[str] = "/"
-    authenticationMode: Optional[APIGatewayAuthenticationMode] = (
+    authenticationMode: Optional[APIGatewayAuthenticationMode] = (  # noqa: N815 - for compatibility with Nuclio https://github.com/nuclio/nuclio/blob/672b8e36f9edd6e42b4685ec1d27cabae3c5f045/pkg/platform/types.go#L476
         APIGatewayAuthenticationMode.none
     )
     upstreams: list[APIGatewayUpstream]
@@ -103,11 +103,11 @@ class APIGateway(_APIGatewayBaseModel):
         ]
 
     def get_invoke_url(self):
-        return (
-            self.spec.host + self.spec.path
-            if self.spec.path and self.spec.host
-            else self.spec.host
-        )
+        if self.spec.host and self.spec.path:
+            return f"{self.spec.host.rstrip('/')}/{self.spec.path.lstrip('/')}".rstrip(
+                "/"
+            )
+        return self.spec.host.rstrip("/")
 
     def enrich_mlrun_names(self):
         self._enrich_api_gateway_mlrun_name()

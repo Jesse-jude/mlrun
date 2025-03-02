@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# flake8: noqa  - this is until we take care of the F401 violations with respect to __all__ & sphinx
-
 __all__ = [
     "BaseRuntime",
     "KubejobRuntime",
@@ -29,6 +27,8 @@ __all__ = [
     "ApplicationRuntime",
     "MpiRuntimeV1",
 ]
+
+import typing
 
 from mlrun.runtimes.utils import resolve_spark_operator_version
 
@@ -58,7 +58,7 @@ from ..serving import MLModelServer, new_v1_model_server  # noqa isort: skip
 def new_model_server(
     name,
     model_class: str,
-    models: dict = None,
+    models: typing.Optional[dict] = None,
     filename="",
     protocol="",
     image="",
@@ -181,7 +181,7 @@ class RuntimeKinds:
         ]
 
     @staticmethod
-    def is_log_collectable_runtime(kind: str):
+    def is_log_collectable_runtime(kind: typing.Optional[str]):
         """
         whether log collector can collect logs for that runtime
         :param kind: kind name
@@ -192,13 +192,18 @@ class RuntimeKinds:
         if RuntimeKinds.is_local_runtime(kind):
             return False
 
-        if kind not in [
-            # dask implementation is different than other runtimes, because few runs can be run against the same runtime
-            # resource, so collecting logs on that runtime resource won't be correct, the way we collect logs for dask
-            # is by using `log_std` on client side after we execute the code against the cluster, as submitting the
-            # run with the dask client will return the run stdout. for more information head to `DaskCluster._run`
-            RuntimeKinds.dask
-        ]:
+        if (
+            kind
+            not in [
+                # dask implementation is different from other runtimes, because few runs can be run against the same
+                # runtime resource, so collecting logs on that runtime resource won't be correct, the way we collect
+                # logs for dask is by using `log_std` on client side after we execute the code against the cluster,
+                # as submitting the run with the dask client will return the run stdout.
+                # For more information head to `DaskCluster._run`.
+                RuntimeKinds.dask
+            ]
+            + RuntimeKinds.nuclio_runtimes()
+        ):
             return True
 
         return False
@@ -234,6 +239,10 @@ class RuntimeKinds:
 
         # both spark and remote spark uses different mechanism for assigning images
         return kind not in [RuntimeKinds.spark, RuntimeKinds.remotespark]
+
+    @staticmethod
+    def supports_from_notebook(kind):
+        return kind not in [RuntimeKinds.application]
 
     @staticmethod
     def resolve_nuclio_runtime(kind: str, sub_kind: str):

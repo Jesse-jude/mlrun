@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import uuid
+import warnings
 from copy import deepcopy
-from typing import Union
+from typing import Optional, Union, cast
 
 import numpy as np
 import yaml
@@ -23,17 +25,24 @@ from dateutil import parser
 
 import mlrun
 import mlrun.common.constants as mlrun_constants
-from mlrun.artifacts import ModelArtifact
+import mlrun.common.formatters
+from mlrun.artifacts import (
+    Artifact,
+    DatasetArtifact,
+    DocumentArtifact,
+    DocumentLoaderSpec,
+    ModelArtifact,
+)
 from mlrun.datastore.store_resources import get_store_resource
 from mlrun.errors import MLRunInvalidArgumentError
 
-from .artifacts import DatasetArtifact
 from .artifacts.manager import ArtifactManager, dict_to_artifact, extend_artifact_path
 from .datastore import store_manager
 from .features import Feature
 from .model import HyperParamOptions
 from .secrets import SecretsStore
 from .utils import (
+    Logger,
     RunKeys,
     dict_to_json,
     dict_to_yaml,
@@ -150,7 +159,7 @@ class MLClientCtx:
         return self._project
 
     @property
-    def logger(self):
+    def logger(self) -> Logger:
         """Built-in logger interface
 
         Example::
@@ -168,6 +177,8 @@ class MLClientCtx:
     @log_level.setter
     def log_level(self, value: str):
         """Set the logging level, e.g. 'debug', 'info', 'error'"""
+        level = logging.getLevelName(value.upper())
+        self._logger.set_logger_level(level)
         self._log_level = value
 
     @property
@@ -189,6 +200,11 @@ class MLClientCtx:
     def artifacts(self):
         """Dictionary of artifacts (read-only)"""
         return deepcopy(self._artifacts_manager.artifact_list())
+
+    @property
+    def artifact_uris(self):
+        """Dictionary of artifact URIs (read-only)"""
+        return deepcopy(self._artifacts_manager.artifact_uris)
 
     @property
     def in_path(self):
@@ -292,7 +308,7 @@ class MLClientCtx:
             )
         self._parent.log_iteration_results(self._iteration, None, self.to_dict())
 
-    def get_store_resource(self, url, secrets: dict = None):
+    def get_store_resource(self, url, secrets: Optional[dict] = None):
         """Get mlrun data resource (feature set/vector, artifact, item) from url.
 
         Example::
@@ -313,7 +329,7 @@ class MLClientCtx:
             data_store_secrets=secrets,
         )
 
-    def get_dataitem(self, url, secrets: dict = None):
+    def get_dataitem(self, url, secrets: Optional[dict] = None):
         """Get mlrun dataitem from url
 
         Example::
@@ -335,7 +351,7 @@ class MLClientCtx:
             "name": self.name,
             "kind": "run",
             "uri": uri,
-            "owner": get_in(self._labels, "owner"),
+            "owner": get_in(self._labels, mlrun_constants.MLRunInternalLabels.owner),
         }
         if mlrun_constants.MLRunInternalLabels.workflow in self._labels:
             resp[mlrun_constants.MLRunInternalLabels.workflow] = self._labels[
@@ -421,8 +437,11 @@ class MLClientCtx:
             self._results = status.get("results", self._results)
             for artifact in status.get("artifacts", []):
                 artifact_obj = dict_to_artifact(artifact)
-                key = artifact_obj.key
-                self._artifacts_manager.artifacts[key] = artifact_obj
+                self._artifacts_manager.artifact_uris[artifact_obj.key] = (
+                    artifact_obj.uri
+                )
+            for key, uri in status.get("artifact_uris", {}).items():
+                self._artifacts_manager.artifact_uris[key] = uri
             self._state = status.get("state", self._state)
 
         # No need to store the run for every worker
@@ -482,11 +501,11 @@ class MLClientCtx:
             return default
         return self._parameters[key]
 
-    def get_project_object(self):
+    def get_project_object(self) -> Optional["mlrun.MlrunProject"]:
         """
         Get the MLRun project object by the project name set in the context.
 
-        :return: The project object or None if it couldn't be retrieved.
+        :returns: The project object or None if it couldn't be retrieved.
         """
         return self._load_project_object()
 
@@ -569,22 +588,25 @@ class MLClientCtx:
         """Reserved for internal use"""
 
         if best:
+            # Recreate the best iteration context for the interface of getting its artifacts
+            best_context = MLClientCtx.from_dict(
+                task, store_run=False, include_status=True
+            )
             self._results["best_iteration"] = best
-            for k, v in get_in(task, ["status", "results"], {}).items():
-                self._results[k] = v
-            for artifact in get_in(task, ["status", RunKeys.artifacts], []):
-                self._artifacts_manager.artifacts[artifact["metadata"]["key"]] = (
-                    artifact
-                )
+            for key, result in best_context.results.items():
+                self._results[key] = result
+            for key, artifact_uri in best_context.artifact_uris.items():
+                self._artifacts_manager.artifact_uris[key] = artifact_uri
+                artifact = best_context.get_artifact(key)
                 self._artifacts_manager.link_artifact(
                     self.project,
                     self.name,
                     self.tag,
-                    artifact["metadata"]["key"],
+                    key,
                     self.iteration,
-                    artifact["spec"]["target_path"],
+                    artifact.target_path,
+                    db_key=artifact.db_key,
                     link_iteration=best,
-                    db_key=artifact["spec"]["db_key"],
                 )
 
         if summary is not None:
@@ -607,7 +629,7 @@ class MLClientCtx:
         format=None,
         db_key=None,
         **kwargs,
-    ):
+    ) -> Artifact:
         """Log an output artifact and optionally upload it to datastore
 
         Example::
@@ -631,7 +653,9 @@ class MLClientCtx:
         :param viewer:        Kubeflow viewer type
         :param target_path:   Absolute target path (instead of using artifact_path + local_path)
         :param src_path:      Deprecated, use local_path
-        :param upload:        Upload to datastore (default is True)
+        :param upload:        Whether to upload the artifact to the datastore. If not provided, and the `local_path`
+                              is not a directory, upload occurs by default. Directories are uploaded only when this
+                              flag is explicitly set to `True`.
         :param labels:        A set of key/value labels to tag the artifact with
         :param format:        Optional, format to use (e.g. csv, parquet, ..)
         :param db_key:        The key to use in the artifact DB table, by default its run name + '_' + key
@@ -673,9 +697,9 @@ class MLClientCtx:
         db_key=None,
         target_path="",
         extra_data=None,
-        label_column: str = None,
+        label_column: Optional[str] = None,
         **kwargs,
-    ):
+    ) -> DatasetArtifact:
         """Log a dataset artifact and optionally upload it to datastore
 
         If the dataset exists with the same key and tag, it will be overwritten.
@@ -713,7 +737,7 @@ class MLClientCtx:
         :param db_key:        The key to use in the artifact DB table, by default its run name + '_' + key
                               db_key=False will not register it in the artifacts table
 
-        :returns: Artifact object
+        :returns: Dataset artifact object
         """
         ds = DatasetArtifact(
             key,
@@ -726,16 +750,19 @@ class MLClientCtx:
             **kwargs,
         )
 
-        item = self._artifacts_manager.log_artifact(
-            self,
-            ds,
-            local_path=local_path,
-            artifact_path=extend_artifact_path(artifact_path, self.artifact_path),
-            target_path=target_path,
-            tag=tag,
-            upload=upload,
-            db_key=db_key,
-            labels=labels,
+        item = cast(
+            DatasetArtifact,
+            self._artifacts_manager.log_artifact(
+                self,
+                ds,
+                local_path=local_path,
+                artifact_path=extend_artifact_path(artifact_path, self.artifact_path),
+                target_path=target_path,
+                tag=tag,
+                upload=upload,
+                db_key=db_key,
+                labels=labels,
+            ),
         )
         self._update_run()
         return item
@@ -754,16 +781,16 @@ class MLClientCtx:
         artifact_path=None,
         upload=True,
         labels=None,
-        inputs: list[Feature] = None,
-        outputs: list[Feature] = None,
-        feature_vector: str = None,
-        feature_weights: list = None,
+        inputs: Optional[list[Feature]] = None,
+        outputs: Optional[list[Feature]] = None,
+        feature_vector: Optional[str] = None,
+        feature_weights: Optional[list] = None,
         training_set=None,
-        label_column: Union[str, list] = None,
+        label_column: Optional[Union[str, list]] = None,
         extra_data=None,
         db_key=None,
         **kwargs,
-    ):
+    ) -> ModelArtifact:
         """Log a model artifact and optionally upload it to datastore
 
         Example::
@@ -782,7 +809,7 @@ class MLClientCtx:
         :param key:             Artifact key or artifact class ()
         :param body:            Will use the body as the artifact content
         :param model_file:      Path to the local model file we upload (see also model_dir)
-                                or to a model file data url (e.g. http://host/path/model.pkl)
+                                or to a model file data url (e.g. `http://host/path/model.pkl`)
         :param model_dir:       Path to the local dir holding the model file and extra files
         :param artifact_path:   Target artifact path (when not using the default)
                                 to define a subpath under the default location use:
@@ -805,7 +832,7 @@ class MLClientCtx:
         :param db_key:          The key to use in the artifact DB table, by default its run name + '_' + key
                                 db_key=False will not register it in the artifacts table
 
-        :returns: Artifact object
+        :returns: Model artifact object
         """
 
         if training_set is not None and inputs:
@@ -832,24 +859,140 @@ class MLClientCtx:
         if training_set is not None:
             model.infer_from_df(training_set, label_column)
 
+        item = cast(
+            ModelArtifact,
+            self._artifacts_manager.log_artifact(
+                self,
+                model,
+                artifact_path=extend_artifact_path(artifact_path, self.artifact_path),
+                tag=tag,
+                upload=upload,
+                db_key=db_key,
+                labels=labels,
+            ),
+        )
+        self._update_run()
+        return item
+
+    def log_document(
+        self,
+        key: str = "",
+        tag: str = "",
+        local_path: str = "",
+        artifact_path: Optional[str] = None,
+        document_loader_spec: DocumentLoaderSpec = DocumentLoaderSpec(),
+        upload: Optional[bool] = False,
+        labels: Optional[dict[str, str]] = None,
+        target_path: Optional[str] = None,
+        db_key: Optional[str] = None,
+        **kwargs,
+    ) -> DocumentArtifact:
+        """
+        Log a document as an artifact.
+
+        :param key: Optional artifact key. If not provided, will be derived from local_path
+                or target_path using DocumentArtifact.key_from_source()
+        :param tag: Version tag
+        :param local_path: path to the local file we upload, will also be use
+                        as the destination subpath (under "artifact_path")
+        :param artifact_path: Target artifact path (when not using the default)
+                            to define a subpath under the default location use:
+                            `artifact_path=context.artifact_subpath('data')`
+        :param document_loader_spec: Spec to use to load the artifact as langchain document.
+
+            By default, uses DocumentLoaderSpec() which initializes with:
+
+            * loader_class_name="langchain_community.document_loaders.TextLoader"
+            * src_name="file_path"
+            * kwargs=None
+
+            Can be customized for different document types, e.g.::
+
+                DocumentLoaderSpec(
+                    loader_class_name="langchain_community.document_loaders.PDFLoader",
+                    src_name="file_path",
+                    kwargs={"extract_images": True}
+                )
+        :param upload: Whether to upload the artifact
+        :param labels:  Key-value labels. A 'source' label is automatically added using either
+                        local_path or target_path to facilitate easier document searching.
+        :param target_path: Path to the local file
+        :param db_key: The key to use in the artifact DB table, by default its run name + '_' + key
+                       db_key=False will not register it in the artifacts table
+        :param kwargs: Additional keyword arguments
+        :return: DocumentArtifact object
+
+        Example:
+            >>> # Log a PDF document with custom loader
+            >>> project.log_document(
+            ...     local_path="path/to/doc.pdf",
+            ...     document_loader_spec=DocumentLoaderSpec(
+            ...         loader_class_name="langchain_community.document_loaders.PDFLoader",
+            ...         src_name="file_path",
+            ...         kwargs={"extract_images": True},
+            ...     ),
+            ... )
+        """
+        original_source = local_path or target_path
+
+        if not key and not original_source:
+            raise ValueError(
+                "Must provide either 'key' parameter or 'local_path'/'target_path' to derive the key from"
+            )
+        if not key:
+            key = DocumentArtifact.key_from_source(original_source)
+
+        doc_artifact = DocumentArtifact(
+            key=key,
+            original_source=original_source,
+            document_loader_spec=document_loader_spec,
+            collections=kwargs.pop("collections", None),
+            **kwargs,
+        )
+
+        # limit label to a max of 255 characters (for db reasons)
+        max_length = 255
+        labels = labels or {}
+        labels["source"] = (
+            original_source[: max_length - 3] + "..."
+            if len(original_source) > max_length
+            else original_source
+        )
+
         item = self._artifacts_manager.log_artifact(
             self,
-            model,
+            doc_artifact,
             artifact_path=extend_artifact_path(artifact_path, self.artifact_path),
             tag=tag,
             upload=upload,
-            db_key=db_key,
             labels=labels,
+            local_path=local_path,
+            target_path=target_path,
+            db_key=db_key,
         )
         self._update_run()
         return item
 
     def get_cached_artifact(self, key):
         """Return a logged artifact from cache (for potential updates)"""
-        return self._artifacts_manager.artifacts[key]
+        warnings.warn(
+            "get_cached_artifact is deprecated in 1.8.0 and will be removed in 1.10.0. Use get_artifact instead.",
+            FutureWarning,
+        )
+        return self.get_artifact(key)
 
-    def update_artifact(self, artifact_object):
-        """Update an artifact object in the cache and the DB"""
+    def get_artifact(
+        self, key, tag=None, iter=None, tree=None, uid=None
+    ) -> Optional[Artifact]:
+        cached_artifact_uri = self._artifacts_manager.artifact_uris.get(key, None)
+        if tag or iter or tree or uid or (not cached_artifact_uri):
+            project = self.get_project_object()
+            return project.get_artifact(key=key, tag=tag, iter=iter, tree=tree, uid=uid)
+        else:
+            return self.get_store_resource(cached_artifact_uri)
+
+    def update_artifact(self, artifact_object: Artifact):
+        """Update an artifact object in the DB and the cached uri"""
         self._artifacts_manager.update_artifact(self, artifact_object)
 
     def commit(self, message: str = "", completed=False):
@@ -879,7 +1022,12 @@ class MLClientCtx:
         if completed and not self.iteration:
             mlrun.runtimes.utils.global_context.set(None)
 
-    def set_state(self, execution_state: str = None, error: str = None, commit=True):
+    def set_state(
+        self,
+        execution_state: Optional[str] = None,
+        error: Optional[str] = None,
+        commit=True,
+    ):
         """
         Modify and store the execution state or mark an error and update the run state accordingly.
         This method allows to set the run state to 'completed' in the DB which is discouraged.
@@ -920,6 +1068,43 @@ class MLClientCtx:
             self._rundb.update_run(
                 updates, self._uid, self.project, iter=self._iteration
             )
+
+    def get_notifications(self, unmask_secret_params=False):
+        """
+        Get the list of notifications
+
+        :param unmask_secret_params: Used as a workaround for sending notification from workflow-runner.
+                                     When used, if the notification will be saved again a new secret will be created.
+        """
+
+        # Get the full notifications from the DB since the run context does not contain the params due to bloating
+        run = self._rundb.read_run(
+            self.uid, format_=mlrun.common.formatters.RunFormat.notifications
+        )
+
+        notifications = []
+        for notification in run["spec"]["notifications"]:
+            notification: mlrun.model.Notification = mlrun.model.Notification.from_dict(
+                notification
+            )
+            # Fill the secret params from the project secret. We cannot use the server side internal secret mechanism
+            # here as it is the client side.
+            # TODO: This is a workaround to allow the notification to get the secret params from project secret
+            #       instead of getting them from the internal project secret that should be mounted.
+            #       We should mount the internal project secret that was created to the workflow-runner
+            #       and get the secret from there.
+            if unmask_secret_params:
+                try:
+                    notification.enrich_unmasked_secret_params_from_project_secret()
+                    notifications.append(notification)
+                except mlrun.errors.MLRunValueError:
+                    logger.warning(
+                        "Failed to fill secret params from project secret for notification."
+                        "Skip this notification.",
+                        notification=notification.name,
+                    )
+
+        return notifications
 
     def to_dict(self):
         """Convert the run context to a dictionary"""
@@ -970,7 +1155,7 @@ class MLClientCtx:
         set_if_not_none(struct["status"], "commit", self._commit)
         set_if_not_none(struct["status"], "iterations", self._iteration_results)
 
-        struct["status"][RunKeys.artifacts] = self._artifacts_manager.artifact_list()
+        struct["status"][RunKeys.artifact_uris] = self._artifacts_manager.artifact_uris
         self._data_stores.to_dict(struct["spec"])
         return struct
 
@@ -1064,7 +1249,9 @@ class MLClientCtx:
         set_if_not_none(struct, "status.commit", self._commit)
         set_if_not_none(struct, "status.iterations", self._iteration_results)
 
-        struct[f"status.{RunKeys.artifacts}"] = self._artifacts_manager.artifact_list()
+        struct[f"status.{RunKeys.artifact_uris}"] = (
+            self._artifacts_manager.artifact_uris
+        )
         return struct
 
     def _init_dbs(self, rundb):
@@ -1078,7 +1265,7 @@ class MLClientCtx:
         self._data_stores = store_manager.set(self._secrets_manager, db=self._rundb)
         self._artifacts_manager = ArtifactManager(db=self._rundb)
 
-    def _load_project_object(self):
+    def _load_project_object(self) -> Optional["mlrun.MlrunProject"]:
         if not self._project_object:
             if not self._project:
                 self.logger.warning(

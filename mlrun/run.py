@@ -30,15 +30,15 @@ from typing import Optional, Union
 
 import nuclio
 import yaml
-from mlrun_pipelines.common.models import RunStatuses
-from mlrun_pipelines.common.ops import format_summary_from_kfp_run, show_kfp_run
-from mlrun_pipelines.utils import get_client
 
 import mlrun.common.constants as mlrun_constants
 import mlrun.common.formatters
 import mlrun.common.schemas
 import mlrun.errors
 import mlrun.utils.helpers
+from mlrun_pipelines.common.models import RunStatuses
+from mlrun_pipelines.common.ops import format_summary_from_kfp_run, show_kfp_run
+from mlrun_pipelines.utils import get_client
 
 from .common.helpers import parse_versioned_object_uri
 from .config import config as mlconf
@@ -65,12 +65,16 @@ from .runtimes.nuclio.application import ApplicationRuntime
 from .runtimes.utils import add_code_metadata, global_context
 from .utils import (
     RunKeys,
+    create_ipython_display,
     extend_hub_uri_if_needed,
     get_in,
     logger,
     retry_until_successful,
     update_in,
 )
+
+if typing.TYPE_CHECKING:
+    from mlrun.datastore import DataItem
 
 
 def function_to_module(code="", workdir=None, secrets=None, silent=False):
@@ -199,7 +203,7 @@ def get_or_create_ctx(
     event=None,
     spec: Optional[dict] = None,
     with_env: bool = True,
-    rundb: str = "",
+    rundb: Union[str, "mlrun.db.RunDBInterface"] = "",
     project: str = "",
     upload_artifacts: bool = False,
     labels: Optional[dict] = None,
@@ -305,7 +309,7 @@ def get_or_create_ctx(
     out = rundb or mlconf.dbpath or environ.get("MLRUN_DBPATH")
     if out:
         autocommit = True
-        logger.info(f"logging run results to: {out}")
+        logger.info(f"Logging run results to: {out}")
 
     newspec["metadata"]["project"] = (
         newspec["metadata"].get("project") or project or mlconf.default_project
@@ -433,7 +437,7 @@ def new_function(
     mode: Optional[str] = None,
     handler: Optional[str] = None,
     source: Optional[str] = None,
-    requirements: Union[str, list[str]] = None,
+    requirements: Optional[list[str]] = None,
     kfp: Optional[bool] = None,
     requirements_file: str = "",
 ):
@@ -744,11 +748,10 @@ def code_to_function(
         raise ValueError("Databricks tasks only support embed_code=True")
 
     if kind == RuntimeKinds.application:
-        if handler:
-            raise MLRunInvalidArgumentError(
-                "Handler is not supported for application runtime"
-            )
-        filename, handler = ApplicationRuntime.get_filename_and_handler()
+        raise MLRunInvalidArgumentError(
+            "Embedding a code file is not supported for application runtime. "
+            "Code files should be specified via project/function source."
+        )
 
     is_nuclio, sub_kind = RuntimeKinds.resolve_nuclio_sub_kind(kind)
     code_origin = add_name(add_code_metadata(filename), name)
@@ -906,13 +909,53 @@ def _run_pipeline(
     return pipeline_run_id
 
 
+def retry_pipeline(
+    run_id: str,
+    project: str,
+    namespace: Optional[str] = None,
+) -> str:
+    """Retry a pipeline run.
+
+    This function retries a previously executed pipeline run using the specified run ID. If the run is not in a
+    retryable state, a new run is created as a clone of the original run.
+
+    :param run_id: ID of the pipeline run to retry.
+    :param project: name of the project associated with the pipeline run.
+    :param namespace: Optional; Kubernetes namespace to use if not the default.
+
+    :returns: ID of the retried pipeline run or the ID of a cloned run if the original run is not retryable.
+    :raises ValueError: If access to the remote API service is not available.
+    """
+    mldb = mlrun.db.get_run_db()
+    if mldb.kind != "http":
+        raise ValueError(
+            "Retrying a pipeline requires access to remote API service. "
+            "Please set the dbpath URL."
+        )
+
+    pipeline_run_id = mldb.retry_pipeline(
+        run_id=run_id,
+        project=project,
+        namespace=namespace,
+    )
+    if pipeline_run_id == run_id:
+        logger.info(
+            f"Retried pipeline run ID={pipeline_run_id}, check UI for progress."
+        )
+    else:
+        logger.info(
+            f"Copy of pipeline {run_id} was retried as run ID={pipeline_run_id}, check UI for progress."
+        )
+    return pipeline_run_id
+
+
 def wait_for_pipeline_completion(
     run_id,
     timeout=60 * 60,
-    expected_statuses: list[str] = None,
+    expected_statuses: Optional[list[str]] = None,
     namespace=None,
     remote=True,
-    project: str = None,
+    project: Optional[str] = None,
 ):
     """Wait for Pipeline status, timeout in sec
 
@@ -942,10 +985,12 @@ def wait_for_pipeline_completion(
     if remote:
         mldb = mlrun.db.get_run_db()
 
+        dag_display_id = create_ipython_display()
+
         def _wait_for_pipeline_completion():
             pipeline = mldb.get_pipeline(run_id, namespace=namespace, project=project)
             pipeline_status = pipeline["run"]["status"]
-            show_kfp_run(pipeline, clear_output=True)
+            show_kfp_run(pipeline, dag_display_id=dag_display_id, with_html=False)
             if pipeline_status not in RunStatuses.stable_statuses():
                 logger.debug(
                     "Waiting for pipeline completion",
@@ -1002,7 +1047,7 @@ def get_pipeline(
     format_: Union[
         str, mlrun.common.formatters.PipelineFormat
     ] = mlrun.common.formatters.PipelineFormat.summary,
-    project: str = None,
+    project: Optional[str] = None,
     remote: bool = True,
 ):
     """Get Pipeline status
@@ -1087,7 +1132,7 @@ def get_object(url, secrets=None, size=None, offset=0, db=None):
     return stores.object(url=url).get(size, offset)
 
 
-def get_dataitem(url, secrets=None, db=None) -> mlrun.datastore.DataItem:
+def get_dataitem(url, secrets=None, db=None) -> "DataItem":
     """get mlrun dataitem object (from path/url)"""
     stores = store_manager.set(secrets, db=db)
     return stores.object(url=url)

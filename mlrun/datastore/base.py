@@ -24,13 +24,11 @@ import pandas as pd
 import pyarrow
 import pytz
 import requests
-import urllib3
-from deprecated import deprecated
 
 import mlrun.config
 import mlrun.errors
 from mlrun.errors import err_to_str
-from mlrun.utils import StorePrefix, is_ipython, logger
+from mlrun.utils import StorePrefix, is_jupyter, logger
 
 from .store_resources import is_store_uri, parse_store_uri
 from .utils import filter_df_start_end_time, select_columns_from_df
@@ -49,7 +47,7 @@ class FileStats:
 class DataStore:
     using_bucket = False
 
-    def __init__(self, parent, name, kind, endpoint="", secrets: dict = None):
+    def __init__(self, parent, name, kind, endpoint="", secrets: Optional[dict] = None):
         self._parent = parent
         self.kind = kind
         self.name = name
@@ -95,16 +93,6 @@ class DataStore:
     @staticmethod
     def uri_to_ipython(endpoint, subpath):
         return ""
-
-    # TODO: remove in 1.8.0
-    @deprecated(
-        version="1.8.0",
-        reason="'get_filesystem()' will be removed in 1.8.0, use "
-        "'filesystem' property instead",
-        category=FutureWarning,
-    )
-    def get_filesystem(self):
-        return self.filesystem
 
     @property
     def filesystem(self) -> Optional[fsspec.AbstractFileSystem]:
@@ -156,6 +144,18 @@ class DataStore:
 
     def put(self, key, data, append=False):
         pass
+
+    def _prepare_put_data(self, data, append=False):
+        mode = "a" if append else "w"
+        if isinstance(data, bytearray):
+            data = bytes(data)
+
+        if isinstance(data, bytes):
+            return data, f"{mode}b"
+        elif isinstance(data, str):
+            return data, mode
+        else:
+            raise TypeError(f"Unable to put a value of type {type(self).__name__}")
 
     def stat(self, key):
         pass
@@ -489,12 +489,18 @@ class DataItem:
         """DataItem url e.g. /dir/path, s3://bucket/path"""
         return self._url
 
-    def get(self, size=None, offset=0, encoding=None):
+    def get(
+        self,
+        size: Optional[int] = None,
+        offset: int = 0,
+        encoding: Optional[str] = None,
+    ) -> Union[bytes, str]:
         """read all or a byte range and return the content
 
         :param size:     number of bytes to get
         :param offset:   fetch from offset (in bytes)
         :param encoding: encoding (e.g. "utf-8") for converting bytes to str
+        :return:         the bytes/str content
         """
         body = self._store.get(self._path, size=size, offset=offset)
         if encoding and isinstance(body, bytes):
@@ -508,7 +514,7 @@ class DataItem:
         """
         self._store.download(self._path, target_path)
 
-    def put(self, data, append=False):
+    def put(self, data: Union[bytes, str], append: bool = False) -> None:
         """write/upload the data, append is only supported by some datastores
 
         :param data:   data (bytes/str) to write
@@ -608,14 +614,14 @@ class DataItem:
         )
         return df
 
-    def show(self, format=None):
+    def show(self, format: Optional[str] = None) -> None:
         """show the data object content in Jupyter
 
         :param format: format to use (when there is no/wrong suffix), e.g. 'png'
         """
-        if not is_ipython:
+        if not is_jupyter:
             logger.warning(
-                "Jupyter/IPython was not detected, .show() will only display inside Jupyter"
+                "Jupyter was not detected. `.show()` displays only inside Jupyter."
             )
             return
 
@@ -660,13 +666,6 @@ class DataItem:
         return f"'{self.url}'"
 
 
-def get_range(size, offset):
-    byterange = f"bytes={offset}-"
-    if size:
-        byterange += str(offset + size)
-    return byterange
-
-
 def basic_auth_header(user, password):
     username = user.encode("latin1")
     password = password.encode("latin1")
@@ -676,7 +675,9 @@ def basic_auth_header(user, password):
 
 
 class HttpStore(DataStore):
-    def __init__(self, parent, schema, name, endpoint="", secrets: dict = None):
+    def __init__(
+        self, parent, schema, name, endpoint="", secrets: Optional[dict] = None
+    ):
         super().__init__(parent, name, schema, endpoint, secrets)
         self._https_auth_token = None
         self._schema = schema
@@ -733,8 +734,6 @@ class HttpStore(DataStore):
 
         verify_ssl = mlconf.httpdb.http.verify
         try:
-            if not verify_ssl:
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             response = requests.get(url, headers=headers, auth=auth, verify=verify_ssl)
         except OSError as exc:
             raise OSError(f"error: cannot connect to {url}: {err_to_str(exc)}")
@@ -748,7 +747,7 @@ class HttpStore(DataStore):
 # As an example, it converts an S3 URL 's3://s3bucket/path' to just 's3bucket/path'.
 # Since 'ds' schemas are not inherently processed by fsspec, we have adapted the _strip_protocol()
 # method specifically to strip away the 'ds' schema as required.
-def makeDatastoreSchemaSanitizer(cls, using_bucket=False, *args, **kwargs):
+def make_datastore_schema_sanitizer(cls, using_bucket=False, *args, **kwargs):
     if not issubclass(cls, fsspec.AbstractFileSystem):
         raise ValueError("Class must be a subclass of fsspec.AbstractFileSystem")
 

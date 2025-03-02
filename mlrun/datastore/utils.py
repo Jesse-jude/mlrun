@@ -26,7 +26,7 @@ import mlrun.datastore
 
 
 def parse_kafka_url(
-    url: str, brokers: typing.Union[list, str] = None
+    url: str, brokers: typing.Optional[typing.Union[list, str]] = None
 ) -> tuple[str, list]:
     """Generating Kafka topic and adjusting a list of bootstrap servers.
 
@@ -71,7 +71,7 @@ def upload_tarball(source_dir, target, secrets=None):
 
 def filter_df_start_end_time(
     df: typing.Union[pd.DataFrame, typing.Iterator[pd.DataFrame]],
-    time_column: str = None,
+    time_column: typing.Optional[str] = None,
     start_time: pd.Timestamp = None,
     end_time: pd.Timestamp = None,
 ) -> typing.Union[pd.DataFrame, typing.Iterator[pd.DataFrame]]:
@@ -222,3 +222,76 @@ def validate_additional_filters(additional_filters):
             for sub_value in value:
                 if isinstance(sub_value, float) and math.isnan(sub_value):
                     raise mlrun.errors.MLRunInvalidArgumentError(nan_error_message)
+
+
+class KafkaParameters:
+    def __init__(self, kwargs: dict):
+        import kafka
+
+        self._kafka = kafka
+        self._kwargs = kwargs
+        self._client_configs = {
+            "consumer": self._kafka.KafkaConsumer.DEFAULT_CONFIG,
+            "producer": self._kafka.KafkaProducer.DEFAULT_CONFIG,
+            "admin": self._kafka.KafkaAdminClient.DEFAULT_CONFIG,
+        }
+        self._custom_attributes = {
+            "max_workers": "",
+            "brokers": "",
+            "topics": "",
+            "group": "",
+            "initial_offset": "",
+            "partitions": "",
+            "sasl": "",
+            "worker_allocation_mode": "",
+        }
+        self._validate_keys()
+
+    def _validate_keys(self) -> None:
+        reference_dicts = (
+            self._custom_attributes,
+            self._kafka.KafkaAdminClient.DEFAULT_CONFIG,
+            self._kafka.KafkaProducer.DEFAULT_CONFIG,
+            self._kafka.KafkaConsumer.DEFAULT_CONFIG,
+        )
+        for key in self._kwargs:
+            if all(key not in d for d in reference_dicts):
+                raise ValueError(
+                    f"Key '{key}' not found in any of the Kafka reference dictionaries"
+                )
+
+    def _get_config(self, client_type: str) -> dict:
+        res = {
+            k: self._kwargs[k]
+            for k in self._kwargs.keys() & self._client_configs[client_type].keys()
+        }
+        if sasl := self._kwargs.get("sasl"):
+            res |= {
+                "security_protocol": "SASL_PLAINTEXT",
+                "sasl_mechanism": sasl["mechanism"],
+                "sasl_plain_username": sasl["user"],
+                "sasl_plain_password": sasl["password"],
+            }
+        return res
+
+    def consumer(self) -> dict:
+        return self._get_config("consumer")
+
+    def producer(self) -> dict:
+        return self._get_config("producer")
+
+    def admin(self) -> dict:
+        return self._get_config("admin")
+
+    def sasl(
+        self, *, usr: typing.Optional[str] = None, pwd: typing.Optional[str] = None
+    ) -> dict:
+        usr = usr or self._kwargs.get("sasl_plain_username", None)
+        pwd = pwd or self._kwargs.get("sasl_plain_password", None)
+        res = self._kwargs.get("sasl", {})
+        if usr and pwd:
+            res["enable"] = True
+            res["user"] = usr
+            res["password"] = pwd
+            res["mechanism"] = self._kwargs.get("sasl_mechanism", "PLAIN")
+        return res

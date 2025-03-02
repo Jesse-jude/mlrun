@@ -11,15 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import builtins
 import collections
 import json
 import pathlib
 import re
+import subprocess
 import unittest.mock
 
 import deepdiff
+import pytest
 import setuptools
 
 import tests.conftest
@@ -39,6 +41,12 @@ def test_extras_requirement_file_aligned():
     extras_requirements_file_specifiers_map = _parse_requirement_specifiers_list(
         extras_requirements_file_specifiers
     )
+    # Since these packages are only present in the mlrun-kfp image, and also can't coexist with each other,
+    # we exclude them from the comparison
+    excluded_packages = ["mlrun_pipelines_kfp_v1_8", "mlrun_pipelines_kfp_v2"]
+    for package in excluded_packages:
+        if package in setup_py_extras_requirements_specifiers_map:
+            setup_py_extras_requirements_specifiers_map.pop(package)
     assert (
         deepdiff.DeepDiff(
             setup_py_extras_requirements_specifiers_map,
@@ -108,16 +116,13 @@ def test_requirement_specifiers_convention():
                 continue
 
     ignored_invalid_map = {
-        # 0.1.0 is not compatible with mlrun >=1.7.0rc19
-        "mlrun-pipelines-kfp-common": {"~=0.1.2"},
-        "mlrun-pipelines-kfp-v1-8": {"~=0.1.2"},
         # See comment near requirement for why we're limiting to patch changes only for all of these
-        "aiobotocore": {">=2.5.0,<2.8"},
-        "storey": {"~=1.7.23"},
+        "aiobotocore": {">=2.5.0,<2.16"},
+        "storey": {"~=1.8.9"},
+        "pydantic": {">=1.10.15", ">=1,<2"},
         "nuclio-sdk": {">=0.5"},
-        "bokeh": {"~=2.4, >=2.4.2"},
-        # protobuf is limited just for docs
         "sphinx-book-theme": {"~=1.0.1"},
+        "scipy": {"~=1.13.0"},
         # These 2 are used in a tests that is purposed to test requirement without specifiers
         "faker": {""},
         "python-dotenv": {""},
@@ -126,24 +131,34 @@ def test_requirement_specifiers_convention():
         "v3io-generator": {
             " @ git+https://github.com/v3io/data-science.git#subdirectory=generator"
         },
-        "databricks-sdk": {"~=0.13.0"},
-        "distributed": {"~=2023.9.0"},
-        "dask": {"~=2023.9.0"},
-        "nbclassic": {">=0.2.8"},
+        "databricks-sdk": {"~=0.20.0"},
+        "docstring_parser": {"~=0.16"},
         "gitpython": {"~=3.1, >=3.1.41"},
-        "pydantic": {"~=1.10, >=1.10.8"},
         "jinja2": {"~=3.1, >=3.1.3"},
         "pyopenssl": {">=23"},
-        "protobuf": {"~=3.20.3", ">=3.20.3, <4"},
         "google-cloud-bigquery": {"[pandas, bqstorage]==3.14.1"},
-        # plotly artifact body in 5.12.0 may contain chars that are not encodable in 'latin-1' encoding
-        # so, it cannot be logged as artifact (raised UnicodeEncode error - ML-3255)
-        "plotly": {"~=5.4, <5.12.0"},
         # due to a bug in apscheduler with python 3.9 https://github.com/agronholm/apscheduler/issues/770
         "apscheduler": {"~=3.6, !=3.10.2"},
         # used in tests
         "aioresponses": {"~=0.7"},
-        "scikit-learn": {"~=1.4.0"},
+        "scikit-learn": {"~=1.5.1"},
+        # ensure minimal version to gain vulnerability fixes
+        "setuptools": {">=75.2"},
+        "dask": {
+            '~=2024.12.1; python_version >= "3.11"',
+            '[array,dataframe,distributed]~=2023.12.1; python_version < "3.11"',
+            '~=2023.12.1; python_version < "3.11"',
+        },
+        "distributed": {
+            '~=2024.12.1; python_version >= "3.11"',
+            '~=2023.12.1; python_version < "3.11"',
+        },
+        "dask-ml": {
+            '~=1.4,<1.9.0; python_version < "3.11"',
+            '~=2024.4.4; python_version >= "3.11"',
+        },
+        "v3io-frames": {'>=0.13.0; python_version >= "3.11"'},
+        "grpcio": {"~=1.70.0"},
     }
 
     for (
@@ -175,15 +190,31 @@ def test_requirement_specifiers_inconsistencies():
             inconsistent_specifiers_map[requirement_name] = requirement_specifiers
 
     ignored_inconsistencies_map = {
-        # The empty specifier is from tests/runtimes/assets/requirements.txt which is there specifically to test the
-        # scenario of requirements without version specifiers
-        "python-dotenv": {"", "~=0.17.0"},
-        # conda requirements since conda does not support ~= operator and
-        # since platform condition is not required for docker
-        "protobuf": {"~=3.20.3", ">=3.20.3, <4"},
-        "pyyaml": {">=5.4.1, <7"},
+        # mlrun api must have v1 due to fastapi https://github.com/fastapi/fastapi/issues/10360
+        # and the fact out pydantic currently requires v1
+        # on the other hand, mlrun client can have both and thus the inconsistency
+        "pydantic": {">=1,<2", ">=1.10.15"},
+        # packages that require specific versions per python version
+        "v3io-frames": {
+            '>=0.13.0; python_version >= "3.11"',
+            '~=0.10.14; python_version < "3.11"',
+        },
+        "dask-ml": {
+            '~=2024.4.4; python_version >= "3.11"',
+            '~=1.4,<1.9.0; python_version < "3.11"',
+        },
+        "dask": {
+            '~=2024.12.1; python_version >= "3.11"',
+            '[array,dataframe,distributed]~=2023.12.1; python_version < "3.11"',
+            '~=2023.12.1; python_version < "3.11"',
+        },
+        "distributed": {
+            '~=2024.12.1; python_version >= "3.11"',
+            '~=2023.12.1; python_version < "3.11"',
+        },
     }
 
+    all_keys_verified = set(ignored_inconsistencies_map.keys())
     for (
         inconsistent_requirement_name,
         inconsistent_specifiers,
@@ -196,8 +227,12 @@ def test_requirement_specifiers_inconsistencies():
             )
             if diff == {}:
                 del inconsistent_specifiers_map[inconsistent_requirement_name]
+            all_keys_verified.remove(inconsistent_requirement_name)
 
     assert inconsistent_specifiers_map == {}
+    assert (
+        len(all_keys_verified) == 0
+    ), f"Keys not verified: {all_keys_verified}, remove them from dictionary"
 
 
 def test_requirement_from_remote():
@@ -228,9 +263,11 @@ def _generate_all_requirement_specifiers_map() -> dict[str, set]:
         pathlib.Path(tests.conftest.root_path).rglob("**/*requirements.txt")
     )
     venv_path = pathlib.Path(tests.conftest.root_path) / "venv"
-    requirements_file_paths = list(
-        filter(lambda path: str(venv_path) not in str(path), requirements_file_paths)
-    )
+    requirements_file_paths = [
+        path
+        for path in requirements_file_paths
+        if str(venv_path) not in str(path) and path.name != "locked-requirements.txt"
+    ]
 
     requirement_specifiers = []
     for requirements_file_path in requirements_file_paths:
@@ -264,9 +301,9 @@ def _parse_requirement_specifiers_list(
         assert (
             match is not None
         ), f"Requirement specifier did not matched regex. {requirement_specifier}"
-        requirement_specifiers_map[match.groupdict()["requirementName"].lower()].add(
-            match.groupdict()["requirementSpecifier"]
-        )
+        requirement_name = match.groupdict()["requirementName"].lower()
+        requirement_specifier = match.groupdict()["requirementSpecifier"]
+        requirement_specifiers_map[requirement_name].add(requirement_specifier)
     return requirement_specifiers_map
 
 
@@ -289,7 +326,7 @@ def _import_extras_requirements():
     setuptools.setup = original_setup
     builtins.open = original_open
 
-    ignored_extras = ["api", "complete", "complete-api", "all", "google-cloud"]
+    ignored_extras = ["api", "complete", "complete-api", "all"]
 
     extras_requirements = []
     for extra_name, extra_requirements in dependencies.extra_requirements().items():
@@ -303,6 +340,8 @@ def _load_requirements(path):
     """
     Load dependencies from requirements file, exactly like `setup.py`
     """
+    base_dir = path.parent
+
     with open(path) as fp:
         deps = []
         for line in fp:
@@ -319,6 +358,14 @@ def _load_requirements(path):
                 deps.append(f"{package} @ {line}")
                 continue
 
+            if line.startswith("-r"):
+                included_path = line.split("-r", 1)[-1].strip()
+                included_path = (base_dir / included_path).resolve()
+                other_deps = _load_requirements(included_path)
+
+                deps.extend(other_deps)
+                continue
+
             # append package
             deps.append(line)
         return deps
@@ -327,3 +374,54 @@ def _load_requirements(path):
 def _is_ignored_requirement_line(line):
     line = line.strip()
     return (not line) or (line[0] == "#")
+
+
+@pytest.mark.skipif(
+    subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], capture_output=True)
+    .stdout.decode()
+    .strip()
+    != "true",
+    reason="Not inside a Git repository",  # e.g. in a Docker image, as happens in the CI
+)
+def test_scikit_learn_requirements_are_aligned() -> None:
+    """
+    We mention `pip install scikit-learn~=x.y.z` many times in the tutorials and
+    in the Docker `requirements.txt` files, check it by running:
+    git grep -n "scikit-learn.="
+
+    This test makes sure all these versions are aligned by catching deviating version specifications.
+    """
+    scikit_learn_version = "1.5.1"
+
+    escaped_version = re.escape(scikit_learn_version)
+    pattern = (
+        f"scikit-learn.=(?!{escaped_version})[0-9\\.]*"  # match only other versions
+    )
+
+    ignored_files = [
+        "tests/test_requirements.py",  # this test file
+        "docs/change-log/index.md",  # a historic document
+        "docs/genai/development/working-with-rag.ipynb",  # includes a generated requirement
+        "dockerfiles/mlrun-api/locked-requirements.txt",  # lock file
+        "dockerfiles/mlrun/locked-requirements.txt",  # lock file
+        "dockerfiles/base/locked-requirements.txt",  # lock file
+        "dockerfiles/jupyter/locked-requirements.txt",  # lock file
+        "dockerfiles/gpu/locked-requirements.txt",  # lock file
+        "dockerfiles/test/locked-requirements.txt",  # lock file
+        "dockerfiles/test-system/locked-requirements.txt",  # lock file
+        "dockerfiles/mlrun-kfp/locked-requirements.txt",  # lock file
+    ]
+    pathspec = [f":!{file}" for file in ignored_files]
+
+    output = subprocess.run(
+        ["git", "grep", "--line-number", "--perl-regexp", pattern, "--", *pathspec],
+        cwd=tests.conftest.root_path,
+        capture_output=True,
+    )
+    no_matches = output.returncode == 1
+    assert no_matches, (
+        "The following files include a scikit-learn requirement which is not aligned "
+        f"to version {scikit_learn_version}:\n{output.stdout.decode()}\n"
+        f"returncode: {output.returncode}\n"
+        f"stderr:\n{output.stderr.decode()}"
+    )

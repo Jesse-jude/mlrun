@@ -22,7 +22,7 @@ import nuclio
 from nuclio import KafkaTrigger
 
 import mlrun
-import mlrun.common.schemas
+import mlrun.common.schemas as schemas
 from mlrun.datastore import get_kafka_brokers_from_dict, parse_kafka_url
 from mlrun.model import ObjectList
 from mlrun.runtimes.function_reference import FunctionReference
@@ -39,7 +39,7 @@ from mlrun.serving.states import (
 )
 from mlrun.utils import get_caller_globals, logger, set_paths
 
-from .function import NuclioSpec, RemoteRuntime
+from .function import NuclioSpec, RemoteRuntime, min_nuclio_versions
 
 serving_subkind = "serving_v2"
 
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 def new_v2_model_server(
     name,
     model_class: str,
-    models: dict = None,
+    models: Optional[dict] = None,
     filename="",
     protocol="",
     image="",
@@ -152,6 +152,7 @@ class ServingSpec(NuclioSpec):
         clone_target_dir=None,
         state_thresholds=None,
         disable_default_http_trigger=None,
+        model_endpoint_creation_task_name=None,
     ):
         super().__init__(
             command=command,
@@ -209,6 +210,7 @@ class ServingSpec(NuclioSpec):
         self.tracking_policy = tracking_policy
         self.secret_sources = secret_sources or []
         self.default_content_type = default_content_type
+        self.model_endpoint_creation_task_name = model_endpoint_creation_task_name
 
     @property
     def graph(self) -> Union[RouterStep, RootFlowStep]:
@@ -309,21 +311,21 @@ class ServingRuntime(RemoteRuntime):
         self,
         stream_path: Optional[str] = None,
         batch: Optional[int] = None,
-        sample: Optional[int] = None,
+        sampling_percentage: float = 100,
         stream_args: Optional[dict] = None,
         tracking_policy: Optional[Union["TrackingPolicy", dict]] = None,
         enable_tracking: bool = True,
     ) -> None:
-        """apply on your serving function to monitor a deployed model, including real-time dashboards to detect drift
-           and analyze performance.
+        """Apply on your serving function to monitor a deployed model, including real-time dashboards to detect drift
+        and analyze performance.
 
-        :param stream_path:         Path/url of the tracking stream e.g. v3io:///users/mike/mystream
-                                    you can use the "dummy://" path for test/simulation.
-        :param batch:               Micro batch size (send micro batches of N records at a time).
-        :param sample:              Sample size (send only one of N records).
-        :param stream_args:         Stream initialization parameters, e.g. shards, retention_in_hours, ..
-        :param enable_tracking:     Enabled/Disable model-monitoring tracking.
-                                    Default True (tracking enabled).
+        :param stream_path:                Path/url of the tracking stream e.g. v3io:///users/mike/mystream
+                                           you can use the "dummy://" path for test/simulation.
+        :param batch:                      Deprecated. Micro batch size (send micro batches of N records at a time).
+        :param sampling_percentage:        Down sampling events that will be pushed to the monitoring stream based on
+                                           a specified percentage. e.g. 50 for 50%. By default, all events are pushed.
+        :param stream_args:                Stream initialization parameters, e.g. shards, retention_in_hours, ..
+        :param enable_tracking:            Enabled/Disable model-monitoring tracking. Default True (tracking enabled).
 
         Example::
 
@@ -336,12 +338,21 @@ class ServingRuntime(RemoteRuntime):
         # Applying model monitoring configurations
         self.spec.track_models = enable_tracking
 
+        if not 0 < sampling_percentage <= 100:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                "`sampling_percentage` must be greater than 0 and less or equal to 100."
+            )
+        self.spec.parameters["sampling_percentage"] = sampling_percentage
+
         if stream_path:
             self.spec.parameters["log_stream"] = stream_path
         if batch:
-            self.spec.parameters["log_stream_batch"] = batch
-        if sample:
-            self.spec.parameters["log_stream_sample"] = sample
+            warnings.warn(
+                "The `batch` size parameter was deprecated in version 1.8.0 and is no longer used. "
+                "It will be removed in 1.10.",
+                # TODO: Remove this in 1.10
+                FutureWarning,
+            )
         if stream_args:
             self.spec.parameters["stream_args"] = stream_args
         if tracking_policy is not None:
@@ -356,12 +367,16 @@ class ServingRuntime(RemoteRuntime):
     def add_model(
         self,
         key: str,
-        model_path: str = None,
-        class_name: str = None,
-        model_url: str = None,
-        handler: str = None,
-        router_step: str = None,
-        child_function: str = None,
+        model_path: Optional[str] = None,
+        class_name: Optional[str] = None,
+        model_url: Optional[str] = None,
+        handler: Optional[str] = None,
+        router_step: Optional[str] = None,
+        child_function: Optional[str] = None,
+        creation_strategy: Optional[
+            schemas.ModelEndpointCreationStrategy
+        ] = schemas.ModelEndpointCreationStrategy.INPLACE,
+        outputs: Optional[list[str]] = None,
         **class_args,
     ):
         """add ml model and/or route to the function.
@@ -384,6 +399,19 @@ class ServingRuntime(RemoteRuntime):
         :param router_step: router step name (to determine which router we add the model to in graphs
                             with multiple router steps)
         :param child_function: child function name, when the model runs in a child function
+        :param creation_strategy: Strategy for creating or updating the model endpoint:
+            * **overwrite**:
+            1. If model endpoints with the same name exist, delete the `latest` one.
+            2. Create a new model endpoint entry and set it as `latest`.
+            * **inplace** (default):
+            1. If model endpoints with the same name exist, update the `latest` entry.
+            2. Otherwise, create a new entry.
+            * **archive**:
+            1. If model endpoints with the same name exist, preserve them.
+            2. Create a new model endpoint with the same name and set it to `latest`.
+        :param outputs: list of the model outputs (e.g. labels) ,if provided will override the outputs that been
+                        configured in the model artifact, please note that those outputs need to be equal to the
+                        model serving function outputs (length, and order)
         :param class_args:  extra kwargs to pass to the model serving class __init__
                             (can be read in the model using .get_param(key) method)
         """
@@ -419,10 +447,15 @@ class ServingRuntime(RemoteRuntime):
         if class_name and hasattr(class_name, "to_dict"):
             if model_path:
                 class_name.model_path = model_path
-            key, state = params_to_step(class_name, key)
+            if outputs:
+                class_name.outputs = outputs
+            key, state = params_to_step(
+                class_name,
+                key,
+                model_endpoint_creation_strategy=creation_strategy,
+                endpoint_type=schemas.EndpointType.LEAF_EP,
+            )
         else:
-            if not model_path and not model_url:
-                raise ValueError("model_path or model_url must be provided")
             class_name = class_name or self.spec.default_class
             if class_name and not isinstance(class_name, str):
                 raise ValueError(
@@ -434,12 +467,23 @@ class ServingRuntime(RemoteRuntime):
                 model_path = str(model_path)
 
             if model_url:
-                state = new_remote_endpoint(model_url, **class_args)
+                state = new_remote_endpoint(
+                    model_url,
+                    creation_strategy=creation_strategy,
+                    endpoint_type=schemas.EndpointType.LEAF_EP,
+                    **class_args,
+                )
             else:
                 class_args = deepcopy(class_args)
                 class_args["model_path"] = model_path
+                class_args["outputs"] = outputs
                 state = TaskStep(
-                    class_name, class_args, handler=handler, function=child_function
+                    class_name,
+                    class_args,
+                    handler=handler,
+                    function=child_function,
+                    model_endpoint_creation_strategy=creation_strategy,
+                    endpoint_type=schemas.EndpointType.LEAF_EP,
                 )
 
         return graph.add_route(key, state)
@@ -480,7 +524,7 @@ class ServingRuntime(RemoteRuntime):
                 trigger_args = stream.trigger_args or {}
 
                 engine = self.spec.graph.engine or "async"
-                if mlrun.mlconf.is_explicit_ack() and engine == "async":
+                if mlrun.mlconf.is_explicit_ack_enabled() and engine == "async":
                     trigger_args["explicit_ack_mode"] = trigger_args.get(
                         "explicit_ack_mode", "explicitOnly"
                     )
@@ -509,7 +553,7 @@ class ServingRuntime(RemoteRuntime):
                         stream.path, group=group, shards=stream.shards, **trigger_args
                     )
 
-    def _deploy_function_refs(self, builder_env: dict = None):
+    def _deploy_function_refs(self, builder_env: Optional[dict] = None):
         """set metadata and deploy child functions"""
         for function_ref in self._spec.function_refs.values():
             logger.info(f"deploy child function {function_ref.name} ...")
@@ -577,13 +621,14 @@ class ServingRuntime(RemoteRuntime):
         self.spec.secret_sources.append({"kind": kind, "source": source})
         return self
 
+    @min_nuclio_versions("1.12.10")
     def deploy(
         self,
         project="",
         tag="",
         verbose=False,
-        auth_info: mlrun.common.schemas.AuthInfo = None,
-        builder_env: dict = None,
+        auth_info: schemas.AuthInfo = None,
+        builder_env: Optional[dict] = None,
         force_build: bool = False,
     ):
         """deploy model serving function to a local/remote cluster
@@ -607,7 +652,7 @@ class ServingRuntime(RemoteRuntime):
         ):
             # initialize or create required streams/queues
             self.spec.graph.check_and_process_graph()
-            self.spec.graph.init_queues()
+            self.spec.graph.create_queue_streams()
             functions_in_steps = self.spec.graph.list_child_functions()
             child_functions = list(self._spec.function_refs.keys())
             for function in functions_in_steps:
@@ -644,12 +689,15 @@ class ServingRuntime(RemoteRuntime):
 
     def _get_serving_spec(self):
         function_name_uri_map = {f.name: f.uri(self) for f in self.spec.function_refs}
-
         serving_spec = {
+            "function_name": self.metadata.name,
+            "function_tag": self.metadata.tag,
             "function_uri": self._function_uri(),
+            "function_hash": self.metadata.hash,
+            "project": self.metadata.project,
             "version": "v2",
             "parameters": self.spec.parameters,
-            "graph": self.spec.graph.to_dict() if self.spec.graph else {},
+            "graph": self.spec.graph.to_dict(strip=True) if self.spec.graph else {},
             "load_mode": self.spec.load_mode,
             "functions": function_name_uri_map,
             "graph_initializer": self.spec.graph_initializer,
@@ -657,6 +705,7 @@ class ServingRuntime(RemoteRuntime):
             "track_models": self.spec.track_models,
             "tracking_policy": None,
             "default_content_type": self.spec.default_content_type,
+            "model_endpoint_creation_task_name": self.spec.model_endpoint_creation_task_name,
         }
 
         if self.spec.secret_sources:
@@ -676,7 +725,6 @@ class ServingRuntime(RemoteRuntime):
         """create mock server object for local testing/emulation
 
         :param namespace: one or list of namespaces/modules to search the steps classes/functions in
-        :param log_level: log level (error | info | debug)
         :param current_function: specify if you want to simulate a child function, * for all functions
         :param track_models: allow model tracking (disabled by default in the mock server)
         :param workdir:   working directory to locate the source code (if not the current one)
@@ -704,10 +752,13 @@ class ServingRuntime(RemoteRuntime):
             verbose=self.verbose,
             current_function=current_function,
             graph_initializer=self.spec.graph_initializer,
-            track_models=track_models and self.spec.track_models,
+            track_models=self.spec.track_models,
             function_uri=self._function_uri(),
             secret_sources=self.spec.secret_sources,
             default_content_type=self.spec.default_content_type,
+            function_name=self.metadata.name,
+            function_tag=self.metadata.tag,
+            project=self.metadata.project,
             **kwargs,
         )
         server.init_states(
@@ -715,6 +766,7 @@ class ServingRuntime(RemoteRuntime):
             namespace=namespace,
             logger=logger,
             is_mock=True,
+            monitoring_mock=self.spec.track_models,
         )
 
         if workdir:

@@ -379,7 +379,7 @@ class Imputer(StepToDict, MLRunStep):
         self,
         method: str = "avg",
         default_value=None,
-        mapping: dict[str, Any] = None,
+        mapping: Optional[dict[str, Any]] = None,
         **kwargs,
     ):
         """Replace None values with default values
@@ -517,7 +517,7 @@ class DateExtractor(StepToDict, MLRunStep):
     def __init__(
         self,
         parts: Union[dict[str, str], list[str]],
-        timestamp_col: str = None,
+        timestamp_col: Optional[str] = None,
         **kwargs,
     ):
         """Date Extractor extracts a date-time component into new columns
@@ -671,7 +671,7 @@ class SetEventMetadata(MapClass):
 
         self._tagging_funcs = []
 
-    def post_init(self, mode="sync"):
+    def post_init(self, mode="sync", **kwargs):
         def add_metadata(name, path, operator=str):
             def _add_meta(event):
                 value = get_in(event.body, path)
@@ -742,4 +742,12 @@ class DropFeatures(StepToDict, MLRunStep):
         if dropped_entities:
             raise mlrun.errors.MLRunInvalidArgumentError(
                 f"DropFeatures can only drop features, not entities: {dropped_entities}"
+            )
+        if feature_set.spec.label_column in features:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"DropFeatures can not drop label_column: {feature_set.spec.label_column}"
+            )
+        if feature_set.spec.timestamp_key in features:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"DropFeatures can not drop timestamp_key: {feature_set.spec.timestamp_key}"
             )

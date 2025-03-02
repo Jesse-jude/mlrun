@@ -13,6 +13,7 @@
 # limitations under the License.
 #
 import uuid
+from typing import Optional
 
 import mlrun
 import mlrun.common.constants as mlrun_constants
@@ -32,7 +33,7 @@ def run_merge_job(
     merger: BaseMerger,
     engine: str,
     engine_args: dict,
-    spark_service: str = None,
+    spark_service: Optional[str] = None,
     entity_rows=None,
     entity_timestamp_column=None,
     run_config=None,
@@ -156,7 +157,9 @@ class RemoteVectorResponse:
 
     def _is_ready(self):
         if self.status != "completed":
-            raise mlrun.errors.MLRunTaskNotReady("feature vector dataset is not ready")
+            raise mlrun.errors.MLRunTaskNotReadyError(
+                "feature vector dataset is not ready"
+            )
         self.vector.reload()
 
     def to_dataframe(self, columns=None, df_module=None, **kwargs):
@@ -181,6 +184,7 @@ class RemoteVectorResponse:
         file_format = kwargs.get("format")
         if not file_format:
             file_format = self.run.status.results["target"]["kind"]
+
         df = mlrun.get_dataitem(self.target_uri).as_df(
             columns=columns, df_module=df_module, format=file_format, **kwargs
         )

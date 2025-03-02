@@ -22,6 +22,7 @@ from nuclio.auth import AuthKinds as NuclioAuthKinds
 
 import mlrun
 import mlrun.common.constants as mlrun_constants
+import mlrun.common.helpers
 import mlrun.common.schemas as schemas
 import mlrun.common.types
 from mlrun.model import ModelObj
@@ -117,10 +118,10 @@ class APIGatewayMetadata(ModelObj):
     def __init__(
         self,
         name: str,
-        namespace: str = None,
-        labels: dict = None,
-        annotations: dict = None,
-        creation_timestamp: str = None,
+        namespace: Optional[str] = None,
+        labels: Optional[dict] = None,
+        annotations: Optional[dict] = None,
+        creation_timestamp: Optional[str] = None,
     ):
         """
         :param name: The name of the API gateway
@@ -168,9 +169,9 @@ class APIGatewaySpec(ModelObj):
             "mlrun.runtimes.nuclio.serving.ServingRuntime",
             "mlrun.runtimes.nuclio.application.ApplicationRuntime",
         ],
-        project: str = None,
+        project: Optional[str] = None,
         description: str = "",
-        host: str = None,
+        host: Optional[str] = None,
         path: str = "/",
         authentication: Optional[APIGatewayAuthenticator] = NoneAuth(),
         canary: Optional[list[int]] = None,
@@ -202,7 +203,12 @@ class APIGatewaySpec(ModelObj):
         self.project = project
         self.ports = ports
 
+        self.enrich()
         self.validate(project=project, functions=functions, canary=canary, ports=ports)
+
+    def enrich(self):
+        if self.path and not self.path.startswith("/"):
+            self.path = f"/{self.path}"
 
     def validate(
         self,
@@ -383,9 +389,10 @@ class APIGateway(ModelObj):
     def invoke(
         self,
         method="POST",
-        headers: dict = None,
+        headers: Optional[dict] = None,
         credentials: Optional[tuple[str, str]] = None,
         path: Optional[str] = None,
+        body: Optional[Union[str, bytes, dict]] = None,
         **kwargs,
     ):
         """
@@ -396,6 +403,7 @@ class APIGateway(ModelObj):
         :param credentials: (Optional[tuple[str, str]], optional) The (username,password) for the invocation if required
             can also be set by the environment variable (_, V3IO_ACCESS_KEY) for access key authentication.
         :param path: (str, optional) The sub-path for the invocation.
+        :param body: (Optional[Union[str, bytes, dict]]) The body of the invocation.
         :param kwargs: (dict) Additional keyword arguments.
 
         :return: The response from the API gateway invocation.
@@ -444,6 +452,13 @@ class APIGateway(ModelObj):
                     "API Gateway invocation requires authentication. Please set V3IO_ACCESS_KEY env var"
                 )
         url = urljoin(self.invoke_url, path or "")
+
+        # Determine the correct keyword argument for the body
+        if isinstance(body, dict):
+            kwargs["json"] = body
+        elif isinstance(body, (str, bytes)):
+            kwargs["data"] = body
+
         return requests.request(
             method=method,
             url=url,
@@ -569,6 +584,21 @@ class APIGateway(ModelObj):
             "true"
         )
 
+    def with_gateway_timeout(self, gateway_timeout: int):
+        """
+        Set gateway proxy connect/read/send timeout annotations
+        :param gateway_timeout: The timeout in seconds
+        """
+        mlrun.runtimes.utils.enrich_gateway_timeout_annotations(
+            self.metadata.annotations, gateway_timeout
+        )
+
+    def with_annotations(self, annotations: dict):
+        """set a key/value annotations in the metadata of the api gateway"""
+        for key, value in annotations.items():
+            self.metadata.annotations[key] = str(value)
+        return self
+
     @classmethod
     def from_scheme(cls, api_gateway: schemas.APIGateway):
         project = api_gateway.metadata.labels.get(
@@ -657,7 +687,7 @@ class APIGateway(ModelObj):
         host = self.spec.host
         if not self.spec.host.startswith("http"):
             host = f"https://{self.spec.host}"
-        return urljoin(host, self.spec.path)
+        return urljoin(host, self.spec.path).rstrip("/")
 
     @staticmethod
     def _generate_basic_auth(username: str, password: str):

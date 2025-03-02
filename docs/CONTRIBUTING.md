@@ -1,7 +1,7 @@
 # Documenting mlrun
 
 This document describes how to write the external documentation for `mlrun`, the
-one you can view at https://mlrun.readthedocs.io
+one you can view at https://docs.mlrun.org/en/latest/.
 
 ## Technology
 
@@ -13,14 +13,20 @@ section publishes as a separate HTML page.
 
 The configuration is at: `docs/conf.py`.
 
-To build the doc, run `make html-docs`, then open `docs/_build/html/index.html`
+To build the doc, run `make html` from the `docs` folder, then open `docs/_build/html/index.html`
+
+### Documentation linter
+
+In order to check that documentation doesn't contain any typos and correctly formatted run `make lint-docs`.
+This command runs `vale` and `blacken-docs`.
+Configuration file for `vale` can be found in `.vale.ini` file.
 
 ## "External" Documentation
 In order to avoid duplication, the `setup` function in `docs/conf.py` copies
 over some markdown files into `docs/external/`. It also generates HTML from a
 notebook in the `examples` directory which is embedded in `docs/examples.rst`.
 
-## readthedocs
+## Docs
 There's a git hook in `readthedocs` that builds the documentation.
 See https://readthedocs.org/projects/mlrun/ for more details.
 Ask @yaronha to add you to the project if you don't have access.
@@ -28,6 +34,14 @@ Ask @yaronha to add you to the project if you don't have access.
 ## Structure 
 
 The master file is `docs/contents.rst`
+
+## Spaces and line breaks
+- If there are 2 spaces at the end of a line, it breaks to the next line in the same paragraph.
+- If there is one space, the text just continues and the publishing creates the appropriate line break.
+
+## Lists
+- Use numbered lists for steps that are executed in a specific order.
+- Use bullets for lists that have no specific order.
 
 ## Language (usage) guidelines
 
@@ -61,10 +75,6 @@ It depends on your sentence. Use **which** after a comma.
 - Yes: There is also an open marketplace that stores many pre-developed functions for...
 - Yes: If you update the project object you need to run project.save(), which updates the project.yaml file....
 - No: There is also an open marketplace which stores many pre-developed functions for...
-
-**Lists**<br>
-- Use numbered lists for steps that are executed in a specific order.
-- Use bullets for lists that have no specific order.
 
 **Tense**<br>
 Use present, active tense.
@@ -130,3 +140,19 @@ mlrun.projects module
 .. autoclass:: MlrunProject
    :members:
 ```
+
+## Tips & Tricks
+
+### Math documentation
+
+Math documentation can be added with:
+
+```text
+:math:`a^2 + b^2 = c^2`
+```
+
+It will show as: $a^2 + b^2 = c^2$.
+
+Note that not all the notations are supported in HTML/PDF outputs.
+For example, instead of `\text{}` command of the `amsmath` package in LaTeX,
+use the more standard `\operatorname{}` command.

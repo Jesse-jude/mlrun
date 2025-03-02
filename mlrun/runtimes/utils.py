@@ -18,6 +18,7 @@ import os
 import re
 from io import StringIO
 from sys import stderr
+from typing import Optional
 
 import pandas as pd
 
@@ -147,7 +148,7 @@ def add_code_metadata(path=""):
 
 def results_to_iter(results, runspec, execution):
     if not results:
-        logger.error("got an empty results list in to_iter")
+        logger.error("Got an empty results list in to_iter")
         return
 
     iter = []
@@ -174,7 +175,7 @@ def results_to_iter(results, runspec, execution):
 
     if not iter:
         execution.set_state("completed", commit=True)
-        logger.warning("warning!, zero iteration results")
+        logger.warning("Warning!, zero iteration results")
         return
     if hasattr(pd, "json_normalize"):
         df = pd.json_normalize(iter).sort_values("iter")
@@ -189,10 +190,10 @@ def results_to_iter(results, runspec, execution):
     item, id = selector(results, criteria)
     if runspec.spec.selector and not id:
         logger.warning(
-            f"no best result selected, check selector ({criteria}) or results"
+            f"No best result selected, check selector ({criteria}) or results"
         )
     if id:
-        logger.info(f"best iteration={id}, used criteria {criteria}")
+        logger.info(f"Best iteration={id}, used criteria {criteria}")
     task = results[item] if id and results else None
     execution.log_iteration_results(id, summary, task)
 
@@ -432,7 +433,7 @@ def enrich_function_from_dict(function, function_dict):
 
 def enrich_run_labels(
     labels: dict,
-    labels_to_enrich: list[RunLabels] = None,
+    labels_to_enrich: Optional[list[RunLabels]] = None,
 ):
     labels_enrichment = {
         RunLabels.owner: os.environ.get("V3IO_USERNAME") or getpass.getuser(),
@@ -445,3 +446,37 @@ def enrich_run_labels(
         if label.value not in labels and enrichment:
             labels[label.value] = enrichment
     return labels
+
+
+def resolve_node_selectors(
+    project_node_selector: dict, instance_node_selector: dict
+) -> dict:
+    config_node_selector = mlrun.mlconf.get_default_function_node_selector()
+    if project_node_selector or config_node_selector:
+        mlrun.utils.logger.debug(
+            "Enriching node selector from project and mlrun config",
+            project_node_selector=project_node_selector,
+            config_node_selector=config_node_selector,
+        )
+        return mlrun.utils.helpers.merge_dicts_with_precedence(
+            config_node_selector,
+            project_node_selector,
+            instance_node_selector,
+        )
+    return instance_node_selector
+
+
+def enrich_gateway_timeout_annotations(annotations: dict, gateway_timeout: int):
+    """
+    Set gateway proxy connect/read/send timeout annotations
+    :param annotations:     The annotations to enrich
+    :param gateway_timeout: The timeout to set
+    """
+    if not gateway_timeout:
+        return
+    gateway_timeout_str = str(gateway_timeout)
+    annotations["nginx.ingress.kubernetes.io/proxy-connect-timeout"] = (
+        gateway_timeout_str
+    )
+    annotations["nginx.ingress.kubernetes.io/proxy-read-timeout"] = gateway_timeout_str
+    annotations["nginx.ingress.kubernetes.io/proxy-send-timeout"] = gateway_timeout_str

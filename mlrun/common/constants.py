@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import mlrun.common.types
 
 IMAGE_NAME_ENRICH_REGISTRY_PREFIX = "."  # prefix for image name to enrich with registry
 MLRUN_SERVING_CONF = "serving-conf"
@@ -24,6 +25,7 @@ MYSQL_MEDIUMBLOB_SIZE_BYTES = 16 * 1024 * 1024
 MLRUN_LABEL_PREFIX = "mlrun/"
 DASK_LABEL_PREFIX = "dask.org/"
 NUCLIO_LABEL_PREFIX = "nuclio.io/"
+RESERVED_TAG_NAME_LATEST = "latest"
 
 
 class MLRunInternalLabels:
@@ -65,6 +67,10 @@ class MLRunInternalLabels:
     task_name = f"{MLRUN_LABEL_PREFIX}task-name"
     resource_name = f"{MLRUN_LABEL_PREFIX}resource_name"
     created = f"{MLRUN_LABEL_PREFIX}created"
+    producer_type = f"{MLRUN_LABEL_PREFIX}producer-type"
+    app_name = f"{MLRUN_LABEL_PREFIX}app-name"
+    endpoint_id = f"{MLRUN_LABEL_PREFIX}endpoint-id"
+    endpoint_name = f"{MLRUN_LABEL_PREFIX}endpoint-name"
     host = "host"
     job_type = "job-type"
     kind = "kind"
@@ -83,3 +89,8 @@ class MLRunInternalLabels:
             for key, value in cls.__dict__.items()
             if not key.startswith("__") and isinstance(value, str)
         ]
+
+
+class DeployStatusTextKind(mlrun.common.types.StrEnum):
+    logs = "logs"
+    events = "events"

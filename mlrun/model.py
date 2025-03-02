@@ -24,7 +24,7 @@ from datetime import datetime
 from os import environ
 from typing import Any, Optional, Union
 
-import pydantic.error_wrappers
+import pydantic.v1.error_wrappers
 
 import mlrun
 import mlrun.common.constants as mlrun_constants
@@ -74,7 +74,10 @@ class ModelObj:
 
     @mlrun.utils.filter_warnings("ignore", FutureWarning)
     def to_dict(
-        self, fields: list = None, exclude: list = None, strip: bool = False
+        self,
+        fields: Optional[list] = None,
+        exclude: Optional[list] = None,
+        strip: bool = False,
     ) -> dict:
         """
         Convert the object to a dict
@@ -114,6 +117,8 @@ class ModelObj:
                 # If one of the attributes is a third party object that has to_dict method (such as k8s objects), then
                 # add it to the object's _fields_to_serialize attribute and handle it in the _serialize_field method.
                 if hasattr(field_value, "to_dict"):
+                    # TODO: Allow passing fields to exclude from the parent object to the child object
+                    #  e.g.: run.to_dict(exclude=["status.artifacts"])
                     field_value = field_value.to_dict(strip=strip)
                     if self._is_valid_field_value_for_serialization(
                         field_name, field_value, strip
@@ -141,7 +146,7 @@ class ModelObj:
         self._apply_enrichment_before_to_dict_completion(struct, strip=strip)
         return struct
 
-    def _resolve_initial_to_dict_fields(self, fields: list = None) -> list:
+    def _resolve_initial_to_dict_fields(self, fields: Optional[list] = None) -> list:
         """
         Resolve fields to be used in to_dict method.
         If fields is None, use `_dict_fields` attribute of the object.
@@ -184,7 +189,7 @@ class ModelObj:
         self,
         struct: dict,
         method: typing.Callable,
-        fields: typing.Union[list, set] = None,
+        fields: Optional[typing.Union[list, set]] = None,
         strip: bool = False,
     ) -> dict:
         for field_name in fields:
@@ -196,14 +201,14 @@ class ModelObj:
         return struct
 
     def _serialize_field(
-        self, struct: dict, field_name: str = None, strip: bool = False
+        self, struct: dict, field_name: Optional[str] = None, strip: bool = False
     ) -> typing.Any:
         # We pull the field from self and not from struct because it was excluded from the struct when looping over
         # the fields to save.
         return getattr(self, field_name, None)
 
     def _enrich_field(
-        self, struct: dict, field_name: str = None, strip: bool = False
+        self, struct: dict, field_name: Optional[str] = None, strip: bool = False
     ) -> typing.Any:
         # We first try to pull from struct because the field might have been already serialized and if not,
         # we pull from self
@@ -215,7 +220,9 @@ class ModelObj:
         return struct
 
     @classmethod
-    def from_dict(cls, struct=None, fields=None, deprecated_fields: dict = None):
+    def from_dict(
+        cls, struct=None, fields=None, deprecated_fields: Optional[dict] = None
+    ):
         """create an object from a python dictionary"""
         struct = {} if struct is None else struct
         deprecated_fields = deprecated_fields or {}
@@ -423,6 +430,19 @@ class ObjectList:
         self._children[child_obj.name] = child_obj
         return child_obj
 
+    def move_to_end(self, child, last=True):
+        self._children.move_to_end(child, last)
+
+    def update_list(self, object_list: "ObjectList", push_at_start: bool = False):
+        if push_at_start:
+            self._children = OrderedDict(
+                list(object_list._children.items()) + list(self._children.items())
+            )
+        else:
+            self._children = OrderedDict(
+                list(self._children.items()) + list(object_list._children.items())
+            )
+
 
 class Credentials(ModelObj):
     generate_access_key = "$generate"
@@ -430,7 +450,7 @@ class Credentials(ModelObj):
 
     def __init__(
         self,
-        access_key: str = None,
+        access_key: Optional[str] = None,
     ):
         self.access_key = access_key
 
@@ -438,6 +458,7 @@ class Credentials(ModelObj):
 class BaseMetadata(ModelObj):
     _default_fields_to_strip = ModelObj._default_fields_to_strip + [
         "hash",
+        "uid",
         # Below are environment specific fields, no need to keep when stripping
         "namespace",
         "project",
@@ -460,10 +481,12 @@ class BaseMetadata(ModelObj):
         categories=None,
         updated=None,
         credentials=None,
+        uid=None,
     ):
         self.name = name
         self.tag = tag
         self.hash = hash
+        self.uid = uid
         self.namespace = namespace
         self.project = project or ""
         self.labels = labels or {}
@@ -487,7 +510,7 @@ class ImageBuilder(ModelObj):
 
     def __init__(
         self,
-        functionSourceCode=None,
+        functionSourceCode=None,  # noqa: N803 - should be "snake_case", kept for BC
         source=None,
         image=None,
         base_image=None,
@@ -500,7 +523,7 @@ class ImageBuilder(ModelObj):
         origin_filename=None,
         with_mlrun=None,
         auto_build=None,
-        requirements: list = None,
+        requirements: Optional[list] = None,
         extra_args=None,
         builder_env=None,
         source_code_target_dir=None,
@@ -549,7 +572,7 @@ class ImageBuilder(ModelObj):
         self,
         image="",
         base_image=None,
-        commands: list = None,
+        commands: Optional[list] = None,
         secret=None,
         source=None,
         extra=None,
@@ -679,7 +702,25 @@ class ImageBuilder(ModelObj):
 
 
 class Notification(ModelObj):
-    """Notification specification"""
+    """Notification object
+
+    :param kind: notification implementation kind - slack, webhook, etc. See
+        :py:class:`mlrun.common.schemas.notification.NotificationKind`
+    :param name: for logging and identification
+    :param message: message content in the notification
+    :param severity: severity to display in the notification
+    :param when: list of statuses to trigger the notification: 'running', 'completed', 'error'
+    :param condition: optional condition to trigger the notification, a jinja2 expression that can use run data
+                      to evaluate if the notification should be sent in addition to the 'when' statuses.
+                      e.g.: '{{ run["status"]["results"]["accuracy"] < 0.9}}'
+    :param params: Implementation specific parameters for the notification implementation (e.g. slack webhook url,
+                   git repository details, etc.)
+    :param secret_params: secret parameters for the notification implementation, same as params but will be stored
+                          in a k8s secret and passed as a secret reference to the implementation.
+    :param status: notification status - pending, sent, error
+    :param sent_time: time the notification was sent
+    :param reason: failure reason if the notification failed to send
+    """
 
     def __init__(
         self,
@@ -716,7 +757,7 @@ class Notification(ModelObj):
     def validate_notification(self):
         try:
             mlrun.common.schemas.notification.Notification(**self.to_dict())
-        except pydantic.error_wrappers.ValidationError as exc:
+        except pydantic.v1.error_wrappers.ValidationError as exc:
             raise mlrun.errors.MLRunInvalidArgumentError(
                 "Invalid notification object"
             ) from exc
@@ -732,14 +773,14 @@ class Notification(ModelObj):
                 "Notification params size exceeds max size of 1 MB"
             )
 
-    def validate_notification_params(self):
-        notification_class = mlrun.utils.notifications.NotificationTypes(
-            self.kind
-        ).get_notification()
-
+    def validate_notification_params(self, default_notification_params=None):
+        default_notification_params = default_notification_params or {}
+        notification_type = mlrun.utils.notifications.NotificationTypes(self.kind)
+        notification_class = notification_type.get_notification()
         secret_params = self.secret_params or {}
         params = self.params or {}
-
+        default_params = default_notification_params.get(notification_type, {})
+        params = notification_class.enrich_default_params(params, default_params)
         # if the secret_params are already masked - no need to validate
         params_secret = secret_params.get("secret", "")
         if params_secret:
@@ -755,6 +796,23 @@ class Notification(ModelObj):
             )
 
         notification_class.validate_params(secret_params | params)
+
+    def enrich_unmasked_secret_params_from_project_secret(self):
+        """
+        Fill the notification secret params from the project secret.
+        We are using this function instead of unmask_secret_params_from_project_secret when we run inside the
+        workflow runner pod that doesn't have access to the k8s secrets (but have access to the project secret)
+        """
+        secret = self.secret_params.get("secret")
+        if secret:
+            secret_value = mlrun.get_secret_or_env(secret)
+            if secret_value:
+                try:
+                    self.secret_params = json.loads(secret_value)
+                except ValueError as exc:
+                    raise mlrun.errors.MLRunValueError(
+                        "Failed to parse secret value"
+                    ) from exc
 
     @staticmethod
     def validate_notification_uniqueness(notifications: list["Notification"]):
@@ -938,7 +996,7 @@ class RunSpec(ModelObj):
         self.node_selector = node_selector or {}
 
     def _serialize_field(
-        self, struct: dict, field_name: str = None, strip: bool = False
+        self, struct: dict, field_name: Optional[str] = None, strip: bool = False
     ) -> Optional[str]:
         # We pull the field from self and not from struct because it was excluded from the struct
         if field_name == "handler":
@@ -1227,6 +1285,8 @@ class RunSpec(ModelObj):
 class RunStatus(ModelObj):
     """Run status"""
 
+    _default_fields_to_strip = ModelObj._default_fields_to_strip + ["artifacts"]
+
     def __init__(
         self,
         state=None,
@@ -1237,12 +1297,13 @@ class RunStatus(ModelObj):
         results=None,
         artifacts=None,
         start_time=None,
+        end_time=None,
         last_update=None,
         iterations=None,
         ui_url=None,
-        reason: str = None,
-        notifications: dict[str, Notification] = None,
-        artifact_uris: dict[str, str] = None,
+        reason: Optional[str] = None,
+        notifications: Optional[dict[str, Notification]] = None,
+        artifact_uris: Optional[dict[str, str]] = None,
     ):
         self.state = state or "created"
         self.status_text = status_text
@@ -1250,15 +1311,68 @@ class RunStatus(ModelObj):
         self.host = host
         self.commit = commit
         self.results = results
-        self.artifacts = artifacts
+        self._artifacts = artifacts
         self.start_time = start_time
+        self.end_time = end_time
         self.last_update = last_update
         self.iterations = iterations
         self.ui_url = ui_url
         self.reason = reason
         self.notifications = notifications or {}
         # Artifact key -> URI mapping, since the full artifacts are not stored in the runs DB table
-        self.artifact_uris = artifact_uris or {}
+        self._artifact_uris = artifact_uris or {}
+
+    @classmethod
+    def from_dict(
+        cls, struct=None, fields=None, deprecated_fields: Optional[dict] = None
+    ):
+        deprecated_fields = {
+            # Set artifacts as deprecated for lazy loading
+            "artifacts": "artifact_uris"
+        }
+        return super().from_dict(
+            struct, fields=fields, deprecated_fields=deprecated_fields
+        )
+
+    @property
+    def artifacts(self):
+        """
+        Artifacts are lazy loaded to reduce memory consumption.
+        We keep artifact_uris (key -> store URI dictionary) to be able to get the run artifacts easily.
+        If the artifact is not already in the cache, we get it from the store (DB).
+        :return: List of artifact dictionaries
+        """
+        self._artifacts = self._artifacts or []
+        existing_artifact_keys = {
+            artifact["metadata"]["key"] for artifact in self._artifacts
+        }
+        for key, uri in self.artifact_uris.items():
+            if key not in existing_artifact_keys:
+                artifact = mlrun.datastore.get_store_resource(uri)
+                self._artifacts.append(artifact.to_dict())
+        return self._artifacts
+
+    @artifacts.setter
+    def artifacts(self, artifacts):
+        self._artifacts = artifacts
+
+    @property
+    def artifact_uris(self):
+        return self._artifact_uris
+
+    @artifact_uris.setter
+    def artifact_uris(self, artifact_uris):
+        resolved_artifact_uris = {}
+        if isinstance(artifact_uris, list):
+            # artifact_uris is the deprecated list of artifacts - convert to new form
+            for artifact in artifact_uris:
+                if isinstance(artifact, dict):
+                    artifact = mlrun.artifacts.dict_to_artifact(artifact)
+                resolved_artifact_uris[artifact.key] = artifact.uri
+        else:
+            resolved_artifact_uris = artifact_uris
+
+        self._artifact_uris = resolved_artifact_uris
 
     def is_failed(self) -> Optional[bool]:
         """
@@ -1468,7 +1582,11 @@ class RunObject(RunTemplate):
     @property
     def error(self) -> str:
         """error string if failed"""
-        if self.status:
+        if (
+            self.status
+            and self.status.state
+            in mlrun.common.runtimes.constants.RunStates.error_and_abortion_states()
+        ):
             unknown_error = ""
             if (
                 self.status.state
@@ -1484,8 +1602,8 @@ class RunObject(RunTemplate):
 
             return (
                 self.status.error
-                or self.status.reason
                 or self.status.status_text
+                or self.status.reason
                 or unknown_error
             )
         return ""
@@ -1562,7 +1680,7 @@ class RunObject(RunTemplate):
 
         return outputs
 
-    def artifact(self, key: str) -> "mlrun.DataItem":
+    def artifact(self, key: str) -> typing.Optional["mlrun.DataItem"]:
         """Return artifact DataItem by key.
 
         This method waits for the outputs to complete, searches for the artifact matching the given key,
@@ -1605,7 +1723,7 @@ class RunObject(RunTemplate):
         :param key: The key of the artifact to retrieve.
         :return: The last artifact DataItem with the given key, or None if no such artifact is found.
         """
-        if not self.status.artifacts:
+        if not self.status.artifacts and not self.status.artifact_uris:
             return None
 
         # Collect artifacts that match the key
@@ -1616,7 +1734,12 @@ class RunObject(RunTemplate):
         ]
 
         if not matching_artifacts:
-            return None
+            if key not in self.status.artifact_uris:
+                return None
+
+            # Get artifact by store URI sanity (should have been enriched by now in status.artifacts property)
+            artifact_uri = self.status.artifact_uris[key]
+            return mlrun.datastore.get_store_resource(artifact_uri)
 
         # Sort matching artifacts by creation date in ascending order.
         # The last element in the list will be the one created most recently.
@@ -1789,6 +1912,11 @@ class RunObject(RunTemplate):
 
         return state
 
+    def abort(self):
+        """abort the run"""
+        db = mlrun.get_run_db()
+        db.abort_run(self.metadata.uid, self.metadata.project)
+
     @staticmethod
     def create_uri(project: str, uid: str, iteration: Union[int, str], tag: str = ""):
         if tag:
@@ -1826,7 +1954,7 @@ class EntrypointParam(ModelObj):
         default=None,
         doc="",
         required=None,
-        choices: list = None,
+        choices: Optional[list] = None,
     ):
         self.name = name
         self.type = type
@@ -2017,14 +2145,16 @@ class DataSource(ModelObj):
     ]
     kind = None
 
+    _fields_to_serialize = ["start_time", "end_time"]
+
     def __init__(
         self,
-        name: str = None,
-        path: str = None,
-        attributes: dict[str, object] = None,
-        key_field: str = None,
-        time_field: str = None,
-        schedule: str = None,
+        name: Optional[str] = None,
+        path: Optional[str] = None,
+        attributes: Optional[dict[str, object]] = None,
+        key_field: Optional[str] = None,
+        time_field: Optional[str] = None,
+        schedule: Optional[str] = None,
         start_time: Optional[Union[datetime, str]] = None,
         end_time: Optional[Union[datetime, str]] = None,
     ):
@@ -2044,6 +2174,16 @@ class DataSource(ModelObj):
 
     def set_secrets(self, secrets):
         self._secrets = secrets
+
+    def _serialize_field(
+        self, struct: dict, field_name: Optional[str] = None, strip: bool = False
+    ) -> typing.Any:
+        value = super()._serialize_field(struct, field_name, strip)
+        # We pull the field from self and not from struct because it was excluded from the struct when looping over
+        # the fields to save.
+        if field_name in ("start_time", "end_time") and isinstance(value, datetime):
+            return value.isoformat()
+        return value
 
 
 class DataTargetBase(ModelObj):
@@ -2068,7 +2208,9 @@ class DataTargetBase(ModelObj):
     ]
 
     @classmethod
-    def from_dict(cls, struct=None, fields=None, deprecated_fields: dict = None):
+    def from_dict(
+        cls, struct=None, fields=None, deprecated_fields: Optional[dict] = None
+    ):
         return super().from_dict(struct, fields=fields)
 
     def get_path(self):
@@ -2084,10 +2226,10 @@ class DataTargetBase(ModelObj):
 
     def __init__(
         self,
-        kind: str = None,
+        kind: Optional[str] = None,
         name: str = "",
         path=None,
-        attributes: dict[str, str] = None,
+        attributes: Optional[dict[str, str]] = None,
         after_step=None,
         partitioned: bool = False,
         key_bucketing_number: Optional[int] = None,
@@ -2095,8 +2237,8 @@ class DataTargetBase(ModelObj):
         time_partitioning_granularity: Optional[str] = None,
         max_events: Optional[int] = None,
         flush_after_seconds: Optional[int] = None,
-        storage_options: dict[str, str] = None,
-        schema: dict[str, Any] = None,
+        storage_options: Optional[dict[str, str]] = None,
+        schema: Optional[dict[str, Any]] = None,
         credentials_prefix=None,
     ):
         self.name = name
@@ -2152,7 +2294,7 @@ class DataTarget(DataTargetBase):
 
     def __init__(
         self,
-        kind: str = None,
+        kind: Optional[str] = None,
         name: str = "",
         path=None,
         online=None,
@@ -2181,12 +2323,12 @@ class DataTarget(DataTargetBase):
 class VersionedObjMetadata(ModelObj):
     def __init__(
         self,
-        name: str = None,
-        tag: str = None,
-        uid: str = None,
-        project: str = None,
-        labels: dict[str, str] = None,
-        annotations: dict[str, str] = None,
+        name: Optional[str] = None,
+        tag: Optional[str] = None,
+        uid: Optional[str] = None,
+        project: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
+        annotations: Optional[dict[str, str]] = None,
         updated=None,
     ):
         self.name = name

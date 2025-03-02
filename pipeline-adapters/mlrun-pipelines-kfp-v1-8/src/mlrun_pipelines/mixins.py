@@ -12,37 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-
-import kfp
-from mlrun_pipelines.common.helpers import PROJECT_ANNOTATION
-from mlrun_pipelines.utils import apply_kfp
+import json
 
 import mlrun
-
-# Disable the warning about reusing components
-kfp.dsl.ContainerOp._DISABLE_REUSABLE_COMPONENT_WARNING = True
-
-
-class KfpAdapterMixin:
-    def apply(self, modify):
-        """
-        Apply a modifier to the runtime which is used to change the runtimes k8s object's spec.
-        Modifiers can be either KFP modifiers or MLRun modifiers (which are compatible with KFP). All modifiers accept
-        a `kfp.dsl.ContainerOp` object, apply some changes on its spec and return it so modifiers can be chained
-        one after the other.
-
-        :param modify: a modifier runnable object
-        :return: the runtime (self) after the modifications
-        """
-
-        # Kubeflow pipeline have a hook to add the component to the DAG on ContainerOp init
-        # we remove the hook to suppress kubeflow op registration and return it after the apply()
-        old_op_handler = kfp.dsl._container_op._register_op_handler
-        kfp.dsl._container_op._register_op_handler = lambda x: self.metadata.name
-        cop = kfp.dsl.ContainerOp("name", "image")
-        kfp.dsl._container_op._register_op_handler = old_op_handler
-
-        return apply_kfp(modify, cop, self)
+from mlrun_pipelines.common.helpers import PROJECT_ANNOTATION
+from mlrun_pipelines.common.models import RunStatuses
 
 
 class PipelineProviderMixin:
@@ -94,3 +68,16 @@ class PipelineProviderMixin:
                     raise NotImplementedError(f"Unknown action: {action}")
 
         return mlrun.mlconf.default_project
+
+    @staticmethod
+    def resolve_error_from_pipeline(pipeline):
+        if pipeline.run.status in [RunStatuses.error, RunStatuses.failed]:
+            # status might not be available just yet
+            workflow_status = json.loads(
+                pipeline.pipeline_runtime.workflow_manifest
+            ).get("status", {})
+            for node in workflow_status.get("nodes", {}).values():
+                # The "DAG" node is the parent node of the pipeline so we skip it for getting the detailed error
+                if node["type"] not in ["DAG", "Skipped"]:
+                    if message := node.get("message"):
+                        return message

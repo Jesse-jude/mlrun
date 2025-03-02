@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import datetime
-from typing import Union
+import unittest
+from io import StringIO
+from typing import Optional, Union
 
+import pandas as pd
 import pytest
+from dateutil import parser
 
 import mlrun.common.schemas
+from mlrun.datastore.datastore_profile import TDEngineDatastoreProfile
+from mlrun.model_monitoring.db.tsdb.tdengine import TDEngineConnector
 from mlrun.model_monitoring.db.tsdb.tdengine.schemas import (
     _MODEL_MONITORING_DATABASE,
     TDEngineSchema,
@@ -32,6 +37,7 @@ _COLUMNS_TEST = {
     "column3": _TDEngineColumn.BINARY_40,
 }
 _TAG_TEST = {"tag1": _TDEngineColumn.INT, "tag2": _TDEngineColumn.BINARY_64}
+_PROJECT = "project-test"
 
 
 class TestTDEngineSchema:
@@ -42,7 +48,10 @@ class TestTDEngineSchema:
     @pytest.fixture
     def super_table() -> TDEngineSchema:
         return TDEngineSchema(
-            super_table=_SUPER_TABLE_TEST, columns=_COLUMNS_TEST, tags=_TAG_TEST
+            super_table=_SUPER_TABLE_TEST,
+            columns=_COLUMNS_TEST,
+            tags=_TAG_TEST,
+            project=_PROJECT,
         )
 
     @staticmethod
@@ -75,7 +84,7 @@ class TestTDEngineSchema:
         remove_tag: bool,
     ):
         assert (
-            super_table._create_subtable_query(subtable=subtable, values=values)
+            super_table._create_subtable_sql(subtable=subtable, values=values)
             == f"CREATE TABLE if NOT EXISTS {_MODEL_MONITORING_DATABASE}.{subtable} "
             f"USING {super_table.super_table} TAGS ('{values['tag1']}', '{values['tag2']}');"
         )
@@ -83,29 +92,7 @@ class TestTDEngineSchema:
             # test with missing tag
             values.pop("tag1")
             with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
-                super_table._create_subtable_query(subtable=subtable, values=values)
-
-    @pytest.mark.parametrize(
-        ("subtable", "remove_value"), [("subtable_1", False), ("subtable_2", True)]
-    )
-    def test_insert_subtable(
-        self,
-        super_table: TDEngineSchema,
-        values: dict[str, Union[str, int, float, datetime.datetime]],
-        subtable: str,
-        remove_value: bool,
-    ):
-        assert (
-            super_table._insert_subtable_query(subtable=subtable, values=values)
-            == f"INSERT INTO {_MODEL_MONITORING_DATABASE}.{subtable} VALUES ('{values['column1']}', "
-            f"'{values['column2']}', '{values['column3']}');"
-        )
-
-        if remove_value:
-            # test with missing value
-            values.pop("column1")
-            with pytest.raises(KeyError):
-                super_table._insert_subtable_query(subtable=subtable, values=values)
+                super_table._create_subtable_sql(subtable=subtable, values=values)
 
     @pytest.mark.parametrize(
         ("subtable", "remove_tag"), [("subtable_1", False), ("subtable_2", True)]
@@ -142,6 +129,14 @@ class TestTDEngineSchema:
             == f"DROP TABLE if EXISTS {_MODEL_MONITORING_DATABASE}.subtable_1;"
         )
 
+    def test_drop_supertable(self, super_table: TDEngineSchema):
+        assert (
+            super_table.drop_supertable_query()
+            == f"DROP STABLE if EXISTS {_MODEL_MONITORING_DATABASE}.{_SUPER_TABLE_TEST}_{_PROJECT};".replace(
+                "-", "_"
+            )
+        )
+
     @pytest.mark.parametrize(
         ("subtable", "remove_tag"), [("subtable_1", False), ("subtable_2", True)]
     )
@@ -154,7 +149,7 @@ class TestTDEngineSchema:
     ):
         assert (
             super_table._get_subtables_query(values=values)
-            == f"SELECT tbname FROM {_MODEL_MONITORING_DATABASE}.{super_table.super_table} "
+            == f"SELECT DISTINCT tbname FROM {_MODEL_MONITORING_DATABASE}.{super_table.super_table} "
             f"WHERE tag1 LIKE '{values['tag1']}' AND tag2 LIKE '{values['tag2']}';"
         )
 
@@ -163,7 +158,7 @@ class TestTDEngineSchema:
             values.pop("tag1")
             assert (
                 super_table._get_subtables_query(values=values)
-                == f"SELECT tbname FROM {_MODEL_MONITORING_DATABASE}.{super_table.super_table} "
+                == f"SELECT DISTINCT tbname FROM {_MODEL_MONITORING_DATABASE}.{super_table.super_table} "
                 f"WHERE tag2 LIKE '{values['tag2']}';"
             )
 
@@ -180,6 +175,11 @@ class TestTDEngineSchema:
             "start",
             "end",
             "timestamp_column",
+            "agg_funcs",
+            "group_by",
+            "preform_agg_funcs_columns",
+            "order_by",
+            "desc",
         ),
         [
             (
@@ -189,6 +189,11 @@ class TestTDEngineSchema:
                 mlrun.utils.datetime_now() - datetime.timedelta(hours=1),
                 mlrun.utils.datetime_now(),
                 "time",
+                None,
+                None,
+                None,
+                None,
+                None,
             ),
             (
                 "subtable_2",
@@ -197,6 +202,50 @@ class TestTDEngineSchema:
                 mlrun.utils.datetime_now() - datetime.timedelta(hours=2),
                 mlrun.utils.datetime_now() - datetime.timedelta(hours=1),
                 "time_column",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "subtable_3",
+                ["column1", "column2"],
+                "column1 > 0",
+                mlrun.utils.datetime_now() - datetime.timedelta(hours=2),
+                mlrun.utils.datetime_now() - datetime.timedelta(hours=1),
+                "time_column",
+                ["avg"],
+                ["column1"],
+                None,
+                None,
+                None,
+            ),
+            (
+                "subtable_4",
+                ["column1", "column2"],
+                "column1 > 0",
+                mlrun.utils.datetime_now() - datetime.timedelta(hours=2),
+                mlrun.utils.datetime_now() - datetime.timedelta(hours=1),
+                "time_column",
+                ["avg"],
+                ["column1"],
+                None,
+                ["column2"],
+                True,
+            ),
+            (
+                "subtable_5",
+                ["column1", "column2"],
+                "column1 > 0",
+                mlrun.utils.datetime_now() - datetime.timedelta(hours=2),
+                mlrun.utils.datetime_now() - datetime.timedelta(hours=1),
+                "time_column",
+                None,
+                ["column1"],
+                None,
+                None,
+                None,
             ),
         ],
     )
@@ -206,38 +255,119 @@ class TestTDEngineSchema:
         subtable: str,
         columns_to_filter: list[str],
         filter_query: str,
-        start: str,
-        end: str,
+        start: datetime.datetime,
+        end: datetime.datetime,
         timestamp_column: str,
+        agg_funcs: Optional[list[str]],
+        group_by: Optional[Union[list[str], str]],
+        preform_agg_funcs_columns: list[str],
+        order_by: Optional[str],
+        desc: bool,
     ):
         if columns_to_filter:
             columns_to_select = ", ".join(columns_to_filter)
         else:
             columns_to_select = "*"
+        if not group_by:
+            if filter_query:
+                expected_query = (
+                    f"SELECT {columns_to_select} FROM {_MODEL_MONITORING_DATABASE}.{subtable} "
+                    f"WHERE {filter_query} AND {timestamp_column} >= '{start}' "
+                    f"AND {timestamp_column} <= '{end}';"
+                )
+            else:
+                expected_query = (
+                    f"SELECT {columns_to_select} FROM {_MODEL_MONITORING_DATABASE}.{subtable} "
+                    f"WHERE {timestamp_column} >= '{start}' AND {timestamp_column} <= '{end}';"
+                )
 
-        if filter_query:
-            expected_query = (
-                f"SELECT {columns_to_select} FROM {_MODEL_MONITORING_DATABASE}.{subtable} "
-                f"WHERE {filter_query} AND {timestamp_column} >= '{start}' "
-                f"AND {timestamp_column} <= '{end}';"
+            assert (
+                super_table._get_records_query(
+                    table=subtable,
+                    columns_to_filter=columns_to_filter,
+                    filter_query=filter_query,
+                    start=start,
+                    end=end,
+                    timestamp_column=timestamp_column,
+                )
+                == expected_query
             )
+
         else:
-            expected_query = (
-                f"SELECT {columns_to_select} FROM {_MODEL_MONITORING_DATABASE}.{subtable} "
-                f"WHERE {timestamp_column} >= '{start}' AND {timestamp_column} <= '{end}';"
-            )
+            with StringIO() as expected_query_group_by:
+                if agg_funcs:
+                    if columns_to_filter:
+                        preform_agg_funcs_columns = (
+                            columns_to_filter
+                            if preform_agg_funcs_columns is None
+                            else preform_agg_funcs_columns
+                        )
+                        columns_to_select = ", ".join(
+                            [
+                                f"{a}({col})"
+                                if col.upper()
+                                in map(
+                                    str.upper, preform_agg_funcs_columns
+                                )  # Case-insensitive check
+                                else f"{col}"
+                                for a in agg_funcs
+                                for col in columns_to_filter
+                            ]
+                        )
+                        expected_query = (
+                            f"SELECT {columns_to_select} FROM {_MODEL_MONITORING_DATABASE}.{subtable} "
+                            f"WHERE {filter_query} AND {timestamp_column} >= '{start}' "
+                            f"AND {timestamp_column} <= '{end}'"
+                        )
+                        expected_query_group_by.write(expected_query)
+                    else:
+                        with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
+                            super_table._get_records_query(
+                                table=subtable,
+                                columns_to_filter=columns_to_filter,
+                                filter_query=filter_query,
+                                start=start,
+                                end=end,
+                                timestamp_column=timestamp_column,
+                                group_by=group_by,
+                                agg_funcs=agg_funcs,
+                            )
+                        return
+                    group_by_joined = ", ".join(group_by)
+                    expected_query_group_by.write(f" GROUP BY {group_by_joined}")
+                else:
+                    with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
+                        super_table._get_records_query(
+                            table=subtable,
+                            columns_to_filter=columns_to_filter,
+                            filter_query=filter_query,
+                            start=start,
+                            end=end,
+                            timestamp_column=timestamp_column,
+                            group_by=group_by,
+                            agg_funcs=agg_funcs,
+                        )
+                    return
 
-        assert (
-            super_table._get_records_query(
-                table=subtable,
-                columns_to_filter=columns_to_filter,
-                filter_query=filter_query,
-                start=start,
-                end=end,
-                timestamp_column=timestamp_column,
-            )
-            == expected_query
-        )
+                if order_by:
+                    desc = "DESC" if desc else ""
+                    expected_query_group_by.write(f" ORDER BY {order_by} {desc}")
+                expected_query_group_by.write(";")
+                assert (
+                    super_table._get_records_query(
+                        table=subtable,
+                        columns_to_filter=columns_to_filter,
+                        filter_query=filter_query,
+                        start=start,
+                        end=end,
+                        timestamp_column=timestamp_column,
+                        group_by=group_by,
+                        agg_funcs=agg_funcs,
+                        order_by=order_by,
+                        desc=desc,
+                    )
+                    == expected_query_group_by.getvalue()
+                )
 
     @pytest.mark.parametrize(
         (
@@ -281,8 +411,8 @@ class TestTDEngineSchema:
         super_table: TDEngineSchema,
         subtable: str,
         columns_to_filter: list[str],
-        start: str,
-        end: str,
+        start: datetime.datetime,
+        end: datetime.datetime,
         timestamp_column: str,
         interval: str,
         limit: int,
@@ -359,3 +489,33 @@ class TestTDEngineSchema:
             )
             == expected_query
         )
+
+
+class TestTDEngineConnector:
+    @pytest.fixture
+    def connector(self):
+        profile = TDEngineDatastoreProfile(
+            name="mm-profile", host="localhost", port=6041, user="root"
+        )
+        return TDEngineConnector(project="test-project", profile=profile)
+
+    def test_get_last_request(self, connector):
+        df = pd.DataFrame(
+            {
+                "endpoint_id": ["ep_1", "ep_2"],
+                "last_request": [
+                    "2024-12-27 05:13:47.56 +00:00",
+                    "2024-12-27 05:13:47 +00:00",
+                ],
+            }
+        )
+        connector._get_records = unittest.mock.Mock(return_value=df)
+        last_request = connector.get_last_request(endpoint_ids=["ep_1"])
+        assert last_request["last_request"][0] == parser.parse(
+            "2024-12-27 05:13:47.56 +00:00"
+        ).astimezone(datetime.timezone.utc)
+
+        last_request = connector.get_last_request(endpoint_ids=["ep_2"])
+        assert last_request["last_request"][1] == parser.parse(
+            "2024-12-27 05:13:47 +00:00"
+        ).astimezone(datetime.timezone.utc)

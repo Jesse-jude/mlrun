@@ -22,10 +22,14 @@ import traceback
 import uuid
 from typing import Optional, Union
 
+from nuclio import Context as NuclioContext
+from nuclio.request import Logger as NuclioLogger
+
 import mlrun
 import mlrun.common.constants
 import mlrun.common.helpers
 import mlrun.model_monitoring
+import mlrun.utils
 from mlrun.config import config
 from mlrun.errors import err_to_str
 from mlrun.secrets import SecretsStore
@@ -38,10 +42,9 @@ from ..errors import MLRunInvalidArgumentError
 from ..model import ModelObj
 from ..utils import get_caller_globals
 from .states import RootFlowStep, RouterStep, get_function, graph_root_setter
-from .utils import (
-    event_id_key,
-    event_path_key,
-)
+from .utils import event_id_key, event_path_key
+
+DUMMY_STREAM = "dummy://"
 
 
 class _StreamContext:
@@ -62,7 +65,7 @@ class _StreamContext:
         self.hostname = socket.gethostname()
         self.function_uri = function_uri
         self.output_stream = None
-        self.stream_uri = None
+        stream_uri = None
         log_stream = parameters.get(FileTargetKind.LOG_STREAM, "")
 
         if (enabled or log_stream) and function_uri:
@@ -71,15 +74,23 @@ class _StreamContext:
                 function_uri, config.default_project
             )
 
-            stream_uri = mlrun.model_monitoring.get_stream_path(project=project)
+            stream_args = parameters.get("stream_args", {})
+
+            if log_stream == DUMMY_STREAM:
+                # Dummy stream used for testing, see tests/serving/test_serving.py
+                stream_uri = DUMMY_STREAM
+            elif not stream_args.get("mock"):  # if not a mock: `context.is_mock = True`
+                stream_uri = mlrun.model_monitoring.get_stream_path(project=project)
 
             if log_stream:
                 # Update the stream path to the log stream value
                 stream_uri = log_stream.format(project=project)
-
-            stream_args = parameters.get("stream_args", {})
-
-            self.output_stream = get_stream_pusher(stream_uri, **stream_args)
+                self.output_stream = get_stream_pusher(stream_uri, **stream_args)
+            else:
+                # Get the output stream from the profile
+                self.output_stream = mlrun.model_monitoring.helpers.get_output_stream(
+                    project=project, mock=stream_args.get("mock", False)
+                )
 
 
 class GraphServer(ModelObj):
@@ -100,6 +111,10 @@ class GraphServer(ModelObj):
         tracking_policy=None,
         secret_sources=None,
         default_content_type=None,
+        function_name=None,
+        function_tag=None,
+        project=None,
+        model_endpoint_creation_task_name=None,
     ):
         self._graph = None
         self.graph: Union[RouterStep, RootFlowStep] = graph
@@ -122,6 +137,10 @@ class GraphServer(ModelObj):
         self.resource_cache = None
         self.default_content_type = default_content_type
         self.http_trigger = True
+        self.function_name = function_name
+        self.function_tag = function_tag
+        self.project = project
+        self.model_endpoint_creation_task_name = model_endpoint_creation_task_name
 
     def set_current_function(self, function):
         """set which child function this server is currently running on"""
@@ -153,6 +172,7 @@ class GraphServer(ModelObj):
         resource_cache: ResourceCache = None,
         logger=None,
         is_mock=False,
+        monitoring_mock=False,
     ):
         """for internal use, initialize all steps (recursively)"""
 
@@ -165,6 +185,7 @@ class GraphServer(ModelObj):
 
         context = GraphContext(server=self, nuclio_context=context, logger=logger)
         context.is_mock = is_mock
+        context.monitoring_mock = monitoring_mock
         context.root = self.graph
 
         context.stream = _StreamContext(
@@ -193,7 +214,7 @@ class GraphServer(ModelObj):
     def test(
         self,
         path: str = "/",
-        body: Union[str, bytes, dict] = None,
+        body: Optional[Union[str, bytes, dict]] = None,
         method: str = "",
         headers: Optional[str] = None,
         content_type: Optional[str] = None,
@@ -315,6 +336,7 @@ def v2_serving_init(context, namespace=None):
     context.logger.info("Initializing server from spec")
     spec = mlrun.utils.get_serving_spec()
     server = GraphServer.from_dict(spec)
+
     if config.log_level.lower() == "debug":
         server.verbose = True
     if hasattr(context, "trigger"):
@@ -358,7 +380,9 @@ def _set_callbacks(server, context):
 
         async def termination_callback():
             context.logger.info("Termination callback called")
-            server.wait_for_completion()
+            maybe_coroutine = server.wait_for_completion()
+            if asyncio.iscoroutine(maybe_coroutine):
+                await maybe_coroutine
             context.logger.info("Termination of async flow is completed")
 
         context.platform.set_termination_callback(termination_callback)
@@ -370,7 +394,9 @@ def _set_callbacks(server, context):
 
         async def drain_callback():
             context.logger.info("Drain callback called")
-            server.wait_for_completion()
+            maybe_coroutine = server.wait_for_completion()
+            if asyncio.iscoroutine(maybe_coroutine):
+                await maybe_coroutine
             context.logger.info(
                 "Termination of async flow is completed. Rerunning async flow."
             )
@@ -390,12 +416,16 @@ def v2_serving_handler(context, event, get_body=False):
 
     # original path is saved in stream_path so it can be used by explicit ack, but path is reset to / as a
     # workaround for NUC-178
-    event.stream_path = event.path
+    # nuclio 1.12.12 added the topic attribute, and we must use it as part of the fix for NUC-233
+    # TODO: Remove fallback on event.path once support for nuclio<1.12.12 is dropped
+    event.stream_path = getattr(event, "topic", event.path)
     if hasattr(event, "trigger") and event.trigger.kind in (
         "kafka",
         "kafka-cluster",
         "v3ioStream",
         "v3io-stream",
+        "rabbit-mq",
+        "rabbitMq",
     ):
         event.path = "/"
 
@@ -486,7 +516,13 @@ class Response:
 class GraphContext:
     """Graph context object"""
 
-    def __init__(self, level="info", logger=None, server=None, nuclio_context=None):
+    def __init__(
+        self,
+        level="info",  # Unused argument
+        logger=None,
+        server=None,
+        nuclio_context: Optional[NuclioContext] = None,
+    ) -> None:
         self.state = None
         self.logger = logger
         self.worker_id = 0
@@ -496,7 +532,7 @@ class GraphContext:
         self.root = None
 
         if nuclio_context:
-            self.logger = nuclio_context.logger
+            self.logger: NuclioLogger = nuclio_context.logger
             self.Response = nuclio_context.Response
             if hasattr(nuclio_context, "trigger") and hasattr(
                 nuclio_context.trigger, "kind"
@@ -506,20 +542,28 @@ class GraphContext:
             if hasattr(nuclio_context, "platform"):
                 self.platform = nuclio_context.platform
         elif not logger:
-            self.logger = mlrun.utils.helpers.logger
+            self.logger: mlrun.utils.Logger = mlrun.utils.logger
 
         self._server = server
         self.current_function = None
         self.get_store_resource = None
         self.get_table = None
         self.is_mock = False
+        self.monitoring_mock = False
+        self._project_obj = None
 
     @property
     def server(self):
         return self._server
 
     @property
-    def project(self):
+    def project_obj(self):
+        if not self._project_obj:
+            self._project_obj = mlrun.get_run_db().get_project(name=self.project)
+        return self._project_obj
+
+    @property
+    def project(self) -> str:
         """current project name (for the current function)"""
         project, _, _, _ = mlrun.common.helpers.parse_versioned_object_uri(
             self._server.function_uri

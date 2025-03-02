@@ -14,23 +14,23 @@
 #
 
 import os
-
-import mlrun_pipelines.common.ops
-from kfp import dsl
-from kfp import kubernetes as kfp_k8s
-from mlrun_pipelines.common.helpers import (
-    FUNCTION_ANNOTATION,
-    PROJECT_ANNOTATION,
-    RUN_ANNOTATION,
-)
-from mlrun_pipelines.common.ops import PipelineRunType
+from typing import Optional
 
 import mlrun
 import mlrun.common.constants as mlrun_constants
 import mlrun.common.runtimes.constants
 import mlrun.utils.helpers
+import mlrun_pipelines.common.ops
 from mlrun.config import config
 from mlrun.utils import get_in, logger
+from mlrun_pipelines.common.constants import PipelineRunType
+from mlrun_pipelines.common.helpers import (
+    FUNCTION_ANNOTATION,
+    PROJECT_ANNOTATION,
+    RUN_ANNOTATION,
+)
+from mlrun_pipelines.imports import dsl
+from mlrun_pipelines.imports import kubernetes as kfp_k8s
 
 
 def generate_kfp_dag_and_resolve_project(run, project=None):
@@ -84,7 +84,8 @@ def generate_kfp_dag_and_resolve_project(run, project=None):
 
 
 def add_default_function_resources(
-    task: dsl.PipelineTask,
+    task,
+    function: dsl.PipelineTask,
 ) -> dsl.PipelineTask:
     __set_task_requests = {
         "cpu": task.set_cpu_request,
@@ -104,6 +105,7 @@ def add_default_function_resources(
         if resource_value:
             __set_task_limits[resource_name](resource_value)
 
+    mlrun_pipelines.common.ops._enrich_gpu_limits(function=function, task=task)
     return task
 
 
@@ -111,8 +113,8 @@ def add_function_node_selection_attributes(
     function, task: dsl.PipelineTask
 ) -> dsl.PipelineTask:
     if not mlrun.runtimes.RuntimeKinds.is_local_runtime(function.kind):
-        enriched_node_selector = (
-            mlrun_pipelines.common.ops._enrich_node_selector_from_project(function)
+        enriched_node_selector = mlrun_pipelines.common.ops._enrich_node_selector(
+            function
         )
         if enriched_node_selector:
             for k, v in enriched_node_selector.items():
@@ -152,8 +154,8 @@ def add_annotations(
     task: dsl.PipelineTask,
     kind: str,
     function,
-    func_url: str = None,
-    project: str = None,
+    func_url: Optional[str] = None,
+    project: Optional[str] = None,
 ):
     # TODO: remove this warning as soon as KFP SDK >=2.7.0 is available for MLRun SDK
     if not hasattr(kfp_k8s, "add_pod_annotation"):
@@ -305,7 +307,7 @@ def generate_pipeline_node(
     task = container_component()
     task.set_display_name(name)
 
-    add_default_function_resources(task)
+    add_default_function_resources(task, function)
     add_function_node_selection_attributes(function, task)
     add_annotations(task, PipelineRunType.run, function, func_url, project_name)
     add_labels(task, function, scrape_metrics)

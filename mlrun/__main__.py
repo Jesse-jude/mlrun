@@ -17,9 +17,8 @@ import json
 import pathlib
 import socket
 import traceback
-import warnings
 from ast import literal_eval
-from base64 import b64decode, b64encode
+from base64 import b64decode
 from os import environ, path, remove
 from pprint import pprint
 
@@ -27,13 +26,14 @@ import click
 import dotenv
 import pandas as pd
 import yaml
-from mlrun_pipelines.mounts import auto_mount as auto_mount_modifier
 from tabulate import tabulate
 
 import mlrun
 import mlrun.common.constants as mlrun_constants
 import mlrun.common.schemas
+import mlrun.utils.helpers
 from mlrun.common.helpers import parse_versioned_object_uri
+from mlrun.runtimes.mounts import auto_mount as auto_mount_modifier
 
 from .config import config as mlconf
 from .db import get_run_db
@@ -297,13 +297,14 @@ def run(
             if url_file and path.isfile(url_file):
                 with open(url_file) as fp:
                     body = fp.read()
-                based = b64encode(body.encode("utf-8")).decode("utf-8")
+                based = mlrun.utils.helpers.encode_user_code(body)
                 logger.info(f"packing code at {url_file}")
                 update_in(runtime, "spec.build.functionSourceCode", based)
                 url = f"main{pathlib.Path(url_file).suffix} {url_args}"
                 update_in(runtime, "spec.build.code_origin", url_file)
     elif runtime:
         runtime = py_eval(runtime)
+        runtime = mlrun.utils.helpers.as_dict(runtime)
         if not isinstance(runtime, dict):
             print(f"Runtime parameter must be a dict, not {type(runtime)}")
             exit(1)
@@ -515,6 +516,7 @@ def build(
 
     if runtime:
         runtime = py_eval(runtime)
+        runtime = mlrun.utils.helpers.as_dict(runtime)
         if not isinstance(runtime, dict):
             print(f"Runtime parameter must be a dict, not {type(runtime)}")
             exit(1)
@@ -554,7 +556,7 @@ def build(
             exit(1)
         with open(source) as fp:
             body = fp.read()
-        based = b64encode(body.encode("utf-8")).decode("utf-8")
+        based = mlrun.utils.helpers.encode_user_code(body)
         logger.info(f"Packing code at {source}")
         b.functionSourceCode = based
         func.spec.command = ""
@@ -662,6 +664,8 @@ def deploy(
         runtime = py_eval(spec)
     else:
         runtime = {}
+
+    runtime = mlrun.utils.helpers.as_dict(runtime)
     if not isinstance(runtime, dict):
         print(f"Runtime parameter must be a dict, not {type(runtime)}")
         exit(1)
@@ -734,9 +738,11 @@ def get(kind, name, selector, namespace, uid, project, tag, db, extra_args):
     if db:
         mlconf.dbpath = db
     if not project:
-        print("Warning, project parameter was not specified using default !")
+        logger.warning(
+            "Project parameter was not specified. Defaulting to 'default' project"
+        )
     if kind.startswith("po"):
-        print("Unsupported, use 'get runtimes' instead")
+        logger.warning("Unsupported, use 'get runtimes' instead")
         return
 
     elif kind.startswith("runtime"):
@@ -765,10 +771,11 @@ def get(kind, name, selector, namespace, uid, project, tag, db, extra_args):
 
         runs = run_db.list_runs(uid=uid, project=project, labels=selector)
         df = runs.to_df()[
-            ["name", "uid", "iter", "start", "state", "parameters", "results"]
+            ["name", "uid", "iter", "start", "end", "state", "parameters", "results"]
         ]
         # df['uid'] = df['uid'].apply(lambda x: f'..{x[-6:]}')
-        df["start"] = df["start"].apply(time_str)
+        for time_column in ["start", "end"]:
+            df[time_column] = df[time_column].apply(time_str)
         df["parameters"] = df["parameters"].apply(dict_to_str)
         df["results"] = df["results"].apply(dict_to_str)
         print(tabulate(df, headers="keys"))
@@ -856,14 +863,8 @@ def version():
 )
 @click.option("--offset", type=int, default=0, help="byte offset")
 @click.option("--db", help="api and db service path/url")
-@click.option("--watch", "-w", is_flag=True, help="Deprecated. not in use")
-def logs(uid, project, offset, db, watch):
+def logs(uid, project, offset, db):
     """Get or watch task logs"""
-    if watch:
-        warnings.warn(
-            "'--watch' is deprecated in 1.6.0, and will be removed in 1.8.0, "
-            # TODO: Remove in 1.8.0
-        )
     mldb = get_run_db(db or mlconf.dbpath)
     if mldb.kind == "http":
         state, _ = mldb.watch_log(uid, project, watch=False, offset=offset)
@@ -1246,10 +1247,10 @@ def show_or_set_config(
         }
         for key, value in env_dict.items():
             if value:
-                dotenv.set_key(filename, key, value, quote_mode="")
+                dotenv.set_key(filename, key, value, quote_mode="always")
         if env_vars:
             for key, value in list2dict(env_vars).items():
-                dotenv.set_key(filename, key, value, quote_mode="")
+                dotenv.set_key(filename, key, value, quote_mode="always")
         if env_file:
             # if its not the default file print the usage details
             print(

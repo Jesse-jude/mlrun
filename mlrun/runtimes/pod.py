@@ -17,14 +17,17 @@ import os
 import re
 import time
 import typing
+import warnings
+from collections.abc import Iterable
 from enum import Enum
 
 import dotenv
 import kubernetes.client as k8s_client
-import mlrun_pipelines.mounts
-from mlrun_pipelines.mixins import KfpAdapterMixin
+from kubernetes.client import V1Volume, V1VolumeMount
 
+import mlrun.common.constants
 import mlrun.errors
+import mlrun.runtimes.mounts
 import mlrun.utils.regex
 from mlrun.common.schemas import (
     NodeSelectorOperator,
@@ -38,6 +41,7 @@ from ..k8s_utils import (
     generate_preemptible_nodes_affinity_terms,
     generate_preemptible_nodes_anti_affinity_terms,
     generate_preemptible_tolerations,
+    validate_node_selectors,
 )
 from ..utils import logger, update_in
 from .base import BaseRuntime, FunctionSpec, spec_fields
@@ -211,13 +215,9 @@ class KubeResourceSpec(FunctionSpec):
         # default service account is set in mlrun.utils.process_function_service_account
         # due to project specific defaults
         self.service_account = service_account
-        self.image_pull_secret = (
-            image_pull_secret or mlrun.mlconf.function.spec.image_pull_secret.default
-        )
+        self.image_pull_secret = image_pull_secret
         self.node_name = node_name
-        self.node_selector = (
-            node_selector or mlrun.mlconf.get_default_function_node_selector()
-        )
+        self.node_selector = node_selector or {}
         self._affinity = affinity
         self.priority_class_name = (
             priority_class_name or mlrun.mlconf.default_function_priority_class_name
@@ -310,7 +310,7 @@ class KubeResourceSpec(FunctionSpec):
         return self._termination_grace_period_seconds
 
     def _serialize_field(
-        self, struct: dict, field_name: str = None, strip: bool = False
+        self, struct: dict, field_name: typing.Optional[str] = None, strip: bool = False
     ) -> typing.Any:
         """
         Serialize a field to a dict, list, or primitive type.
@@ -322,7 +322,7 @@ class KubeResourceSpec(FunctionSpec):
         return super()._serialize_field(struct, field_name, strip)
 
     def _enrich_field(
-        self, struct: dict, field_name: str = None, strip: bool = False
+        self, struct: dict, field_name: typing.Optional[str] = None, strip: bool = False
     ) -> typing.Any:
         k8s_api = k8s_client.ApiClient()
         if strip:
@@ -367,6 +367,35 @@ class KubeResourceSpec(FunctionSpec):
                 + f"service accounts {allowed_service_accounts}"
             )
 
+    def with_volumes(
+        self,
+        volumes: typing.Union[list[dict], dict, V1Volume],
+    ) -> "KubeResourceSpec":
+        """Add volumes to the volumes dictionary, only used as part of the mlrun_pipelines mount functions."""
+        if isinstance(volumes, dict):
+            set_named_item(self._volumes, volumes)
+        elif isinstance(volumes, Iterable):
+            for volume in volumes:
+                set_named_item(self._volumes, volume)
+        else:
+            set_named_item(self._volumes, volumes)
+        return self
+
+    def with_volume_mounts(
+        self,
+        volume_mounts: typing.Union[list[dict], dict, V1VolumeMount],
+    ) -> "KubeResourceSpec":
+        """Add volume mounts to the volume mounts dictionary,
+        only used as part of the mlrun_pipelines mount functions."""
+        if isinstance(volume_mounts, dict):
+            self._set_volume_mount(volume_mounts)
+        elif isinstance(volume_mounts, Iterable):
+            for volume_mount in volume_mounts:
+                self._set_volume_mount(volume_mount)
+        else:
+            self._set_volume_mount(volume_mounts)
+        return self
+
     def _set_volume_mount(
         self, volume_mount, volume_mounts_field_name="_volume_mounts"
     ):
@@ -381,9 +410,9 @@ class KubeResourceSpec(FunctionSpec):
     def _verify_and_set_limits(
         self,
         resources_field_name,
-        mem: str = None,
-        cpu: str = None,
-        gpus: int = None,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
+        gpus: typing.Optional[int] = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -431,8 +460,8 @@ class KubeResourceSpec(FunctionSpec):
     def _verify_and_set_requests(
         self,
         resources_field_name,
-        mem: str = None,
-        cpu: str = None,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
         patch: bool = False,
     ):
         resources = verify_requests(resources_field_name, mem=mem, cpu=cpu)
@@ -457,9 +486,9 @@ class KubeResourceSpec(FunctionSpec):
 
     def with_limits(
         self,
-        mem: str = None,
-        cpu: str = None,
-        gpus: int = None,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
+        gpus: typing.Optional[int] = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -475,7 +504,12 @@ class KubeResourceSpec(FunctionSpec):
         """
         self._verify_and_set_limits("resources", mem, cpu, gpus, gpu_type, patch=patch)
 
-    def with_requests(self, mem: str = None, cpu: str = None, patch: bool = False):
+    def with_requests(
+        self,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
+        patch: bool = False,
+    ):
         """
         Set requested (desired) pod cpu/memory resources
 
@@ -532,7 +566,7 @@ class KubeResourceSpec(FunctionSpec):
             return
 
         # merge node selectors - precedence to existing node selector
-        self.node_selector = mlrun.utils.helpers.merge_with_precedence(
+        self.node_selector = mlrun.utils.helpers.merge_dicts_with_precedence(
             node_selector, self.node_selector
         )
 
@@ -670,29 +704,7 @@ class KubeResourceSpec(FunctionSpec):
                 ),
                 affinity_field_name=affinity_field_name,
             )
-        # purge any affinity / anti-affinity preemption related configuration and enrich with preemptible tolerations
         elif self_preemption_mode == PreemptionModes.allow.value:
-            # remove preemptible anti-affinity
-            self._prune_affinity_node_selector_requirement(
-                generate_preemptible_node_selector_requirements(
-                    NodeSelectorOperator.node_selector_op_not_in.value
-                ),
-                affinity_field_name=affinity_field_name,
-            )
-            # remove preemptible affinity
-            self._prune_affinity_node_selector_requirement(
-                generate_preemptible_node_selector_requirements(
-                    NodeSelectorOperator.node_selector_op_in.value
-                ),
-                affinity_field_name=affinity_field_name,
-            )
-
-            # remove preemptible nodes constrain
-            self._prune_node_selector(
-                mlconf.get_preemptible_node_selector(),
-                node_selector_field_name=node_selector_field_name,
-            )
-
             # enrich with tolerations
             self._merge_tolerations(
                 generate_preemptible_tolerations(),
@@ -937,12 +949,12 @@ class AutoMountType(str, Enum):
     @classmethod
     def all_mount_modifiers(cls):
         return [
-            mlrun_pipelines.mounts.v3io_cred.__name__,
-            mlrun_pipelines.mounts.mount_v3io.__name__,
-            mlrun_pipelines.mounts.mount_pvc.__name__,
-            mlrun_pipelines.mounts.auto_mount.__name__,
-            mlrun_pipelines.mounts.mount_s3.__name__,
-            mlrun_pipelines.mounts.set_env_variables.__name__,
+            mlrun.runtimes.mounts.v3io_cred.__name__,
+            mlrun.runtimes.mounts.mount_v3io.__name__,
+            mlrun.runtimes.mounts.mount_pvc.__name__,
+            mlrun.runtimes.mounts.auto_mount.__name__,
+            mlrun.runtimes.mounts.mount_s3.__name__,
+            mlrun.runtimes.mounts.set_env_variables.__name__,
         ]
 
     @classmethod
@@ -959,27 +971,27 @@ class AutoMountType(str, Enum):
     def _get_auto_modifier():
         # If we're running on Iguazio - use v3io_cred
         if mlconf.igz_version != "":
-            return mlrun_pipelines.mounts.v3io_cred
+            return mlrun.runtimes.mounts.v3io_cred
         # Else, either pvc mount if it's configured or do nothing otherwise
         pvc_configured = (
             "MLRUN_PVC_MOUNT" in os.environ
             or "pvc_name" in mlconf.get_storage_auto_mount_params()
         )
-        return mlrun_pipelines.mounts.mount_pvc if pvc_configured else None
+        return mlrun.runtimes.mounts.mount_pvc if pvc_configured else None
 
     def get_modifier(self):
         return {
             AutoMountType.none: None,
-            AutoMountType.v3io_credentials: mlrun_pipelines.mounts.v3io_cred,
-            AutoMountType.v3io_fuse: mlrun_pipelines.mounts.mount_v3io,
-            AutoMountType.pvc: mlrun_pipelines.mounts.mount_pvc,
+            AutoMountType.v3io_credentials: mlrun.runtimes.mounts.v3io_cred,
+            AutoMountType.v3io_fuse: mlrun.runtimes.mounts.mount_v3io,
+            AutoMountType.pvc: mlrun.runtimes.mounts.mount_pvc,
             AutoMountType.auto: self._get_auto_modifier(),
-            AutoMountType.s3: mlrun_pipelines.mounts.mount_s3,
-            AutoMountType.env: mlrun_pipelines.mounts.set_env_variables,
+            AutoMountType.s3: mlrun.runtimes.mounts.mount_s3,
+            AutoMountType.env: mlrun.runtimes.mounts.set_env_variables,
         }[self]
 
 
-class KubeResource(BaseRuntime, KfpAdapterMixin):
+class KubeResource(BaseRuntime):
     """
     A parent class for runtimes that generate k8s resources when executing.
     """
@@ -1021,7 +1033,8 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
 
     def get_env(self, name, default=None):
         """Get the pod environment variable for the given name, if not found return the default
-        If it's a scalar value, will return it, if the value is from source, return the k8s struct (V1EnvVarSource)"""
+        If it's a scalar value, will return it, if the value is from source, return the k8s struct (V1EnvVarSource)
+        """
         for env_var in self.spec.env:
             if get_item_name(env_var) == name:
                 # valueFrom is a workaround for now, for some reason the envs aren't getting sanitized
@@ -1051,7 +1064,11 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
         self.spec.env.append(new_var)
         return self
 
-    def set_envs(self, env_vars: dict = None, file_path: str = None):
+    def set_envs(
+        self,
+        env_vars: typing.Optional[dict] = None,
+        file_path: typing.Optional[str] = None,
+    ):
         """set pod environment var from key/value dict or .env file
 
         :param env_vars:  dict with env key/values
@@ -1071,11 +1088,16 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
             else:
                 raise mlrun.errors.MLRunNotFoundError(f"{file_path} does not exist")
         for name, value in env_vars.items():
-            self.set_env(name, value)
+            if isinstance(value, dict) and "valueFrom" in value:
+                self.set_env(name, value_from=value["valueFrom"])
+            else:
+                self.set_env(name, value)
         return self
 
     def set_image_pull_configuration(
-        self, image_pull_policy: str = None, image_pull_secret_name: str = None
+        self,
+        image_pull_policy: typing.Optional[str] = None,
+        image_pull_secret_name: typing.Optional[str] = None,
     ):
         """
         Configure the image pull parameters for the runtime.
@@ -1108,12 +1130,12 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
 
         :param state_thresholds: A dictionary of state to threshold. The supported states are:
 
-            * pending_scheduled - The pod/crd is scheduled on a node but not yet running
-            * pending_not_scheduled - The pod/crd is not yet scheduled on a node
-            * executing - The pod/crd started and is running
-            * image_pull_backoff - The pod/crd is in image pull backoff
-            See mlrun.mlconf.function.spec.state_thresholds for the default thresholds.
+                                 * pending_scheduled - The pod/crd is scheduled on a node but not yet running
+                                 * pending_not_scheduled - The pod/crd is not yet scheduled on a node
+                                 * executing - The pod/crd started and is running
+                                 * image_pull_backoff - The pod/crd is in image pull backoff
 
+                                See :code:`mlrun.mlconf.function.spec.state_thresholds` for the default thresholds.
         :param patch: Whether to merge the given thresholds with the existing thresholds (True, default)
                       or override them (False)
         """
@@ -1124,9 +1146,9 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
 
     def with_limits(
         self,
-        mem: str = None,
-        cpu: str = None,
-        gpus: int = None,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
+        gpus: typing.Optional[int] = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -1142,7 +1164,12 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
         """
         self.spec.with_limits(mem, cpu, gpus, gpu_type, patch=patch)
 
-    def with_requests(self, mem: str = None, cpu: str = None, patch: bool = False):
+    def with_requests(
+        self,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
+        patch: bool = False,
+    ):
         """
         Set requested (desired) pod cpu/memory resources
 
@@ -1153,6 +1180,132 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
         """
         self.spec.with_requests(mem, cpu, patch=patch)
 
+    def detect_preemptible_node_selector(
+        self, node_selector: dict[str, str]
+    ) -> list[str]:
+        """
+        Checks if any provided node selector matches the preemptible node selectors.
+        Issues a warning if a selector may be pruned at runtime depending on preemption mode.
+
+        :param node_selector: The user-provided node selector dictionary.
+        """
+        preemptible_node_selector = mlconf.get_preemptible_node_selector()
+
+        return [
+            f"'{key}': '{val}'"
+            for key, val in node_selector.items()
+            if preemptible_node_selector.get(key) == val
+        ]
+
+    def detect_preemptible_tolerations(
+        self, tolerations: list[k8s_client.V1Toleration]
+    ) -> list[str]:
+        """
+        Checks if any provided toleration matches preemptible tolerations.
+        Issues a warning if a toleration may be pruned at runtime depending on preemption mode.
+
+        :param tolerations: The user-provided list of tolerations.
+        """
+        preemptible_tolerations = [
+            k8s_client.V1Toleration(
+                key=toleration.get("key"),
+                value=toleration.get("value"),
+                effect=toleration.get("effect"),
+            )
+            for toleration in mlconf.get_preemptible_tolerations()
+        ]
+
+        def _format_toleration(toleration):
+            return f"'{toleration.key}'='{toleration.value}' (effect: '{toleration.effect}')"
+
+        return [
+            _format_toleration(toleration)
+            for toleration in tolerations
+            if toleration in preemptible_tolerations
+        ]
+
+    def detect_preemptible_affinity(self, affinity: k8s_client.V1Affinity) -> list[str]:
+        """
+        Checks if any provided affinity rules match preemptible affinity configurations.
+        Issues a warning if an affinity rule may be pruned at runtime depending on preemption mode.
+
+        :param affinity: The user-provided affinity object.
+        """
+
+        preemptible_affinity_terms = generate_preemptible_nodes_affinity_terms()
+        conflicting_affinities = []
+
+        if (
+            affinity
+            and affinity.node_affinity
+            and affinity.node_affinity.required_during_scheduling_ignored_during_execution
+        ):
+            user_terms = affinity.node_affinity.required_during_scheduling_ignored_during_execution.node_selector_terms
+            for user_term in user_terms:
+                user_expressions = {
+                    (expr.key, expr.operator, tuple(expr.values or []))
+                    for expr in user_term.match_expressions or []
+                }
+
+                for preemptible_term in preemptible_affinity_terms:
+                    preemptible_expressions = {
+                        (expr.key, expr.operator, tuple(expr.values or []))
+                        for expr in preemptible_term.match_expressions or []
+                    }
+
+                    # Ensure operators match and preemptible expressions are present
+                    common_exprs = user_expressions & preemptible_expressions
+                    if common_exprs:
+                        formatted = ", ".join(
+                            f"'{key}  {operator}  {list(values)}'"
+                            for key, operator, values in common_exprs
+                        )
+                        conflicting_affinities.append(formatted)
+        return conflicting_affinities
+
+    def raise_preemptible_warning(
+        self,
+        node_selector: typing.Optional[dict[str, str]],
+        tolerations: typing.Optional[list[k8s_client.V1Toleration]],
+        affinity: typing.Optional[k8s_client.V1Affinity],
+    ) -> None:
+        """
+        Detects conflicts and issues a single warning if necessary.
+
+        :param node_selector: The user-provided node selector dictionary.
+        :param tolerations: The user-provided list of tolerations.
+        :param affinity: The user-provided affinity object.
+        """
+        conflict_messages = []
+
+        if node_selector:
+            ns_conflicts = ", ".join(
+                self.detect_preemptible_node_selector(node_selector)
+            )
+            if ns_conflicts:
+                conflict_messages.append(f"Node selectors: {ns_conflicts}")
+
+        if tolerations:
+            tol_conflicts = ", ".join(self.detect_preemptible_tolerations(tolerations))
+            if tol_conflicts:
+                conflict_messages.append(f"Tolerations: {tol_conflicts}")
+
+        if affinity:
+            affinity_conflicts = ", ".join(self.detect_preemptible_affinity(affinity))
+            if affinity_conflicts:
+                conflict_messages.append(f"Affinity: {affinity_conflicts}")
+
+        if conflict_messages:
+            warning_componentes = "; \n".join(conflict_messages)
+            warnings.warn(
+                f"Warning: based on the preemptible node settings configured in your MLRun configuration,\n"
+                f"{warning_componentes}\n"
+                f" may be removed or adjusted at runtime.\n"
+                "This adjustment depends on the function's preemption mode. \n"
+                "The list of potential adjusted preemptible selectors can be viewed here: "
+                "mlrun.mlconf.get_preemptible_node_selector() and mlrun.mlconf.get_preemptible_tolerations()."
+            )
+
     def with_node_selection(
         self,
         node_name: typing.Optional[str] = None,
@@ -1161,27 +1314,29 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
         tolerations: typing.Optional[list[k8s_client.V1Toleration]] = None,
     ):
         """
-        Enables to control on which k8s node the job will run
+        Enables control over which Kubernetes node the job will run on.
 
-        :param node_name:       The name of the k8s node
-        :param node_selector:   Label selector, only nodes with matching labels will be eligible to be picked
-        :param affinity:        Expands the types of constraints you can express - see
-                                https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity
-                                for details
-        :param tolerations:     Tolerations are applied to pods, and allow (but do not require) the pods to schedule
-                                onto nodes with matching taints - see
-                                https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration
-                                for details
-
+        :param node_name:       The name of the Kubernetes node.
+        :param node_selector:   Label selector, only nodes with matching labels will be eligible.
+        :param affinity:        Defines scheduling constraints.
+        :param tolerations:     Allows scheduling onto nodes with matching taints.
         """
+        # Apply values as before
         if node_name:
             self.spec.node_name = node_name
-        if node_selector:
+        if node_selector is not None:
+            validate_node_selectors(node_selectors=node_selector, raise_on_error=False)
             self.spec.node_selector = node_selector
-        if affinity:
+        if affinity is not None:
             self.spec.affinity = affinity
         if tolerations is not None:
             self.spec.tolerations = tolerations
+
+        self.raise_preemptible_warning(
+            node_selector=self.spec.node_selector,
+            tolerations=self.spec.tolerations,
+            affinity=self.spec.affinity,
+        )
 
     def with_priority_class(self, name: typing.Optional[str] = None):
         """
@@ -1252,6 +1407,36 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
                 "Security context is handled internally when enrichment mode is not disabled"
             )
         self.spec.security_context = security_context
+
+    def apply(
+        self,
+        modifier: typing.Callable[["KubeResource"], "KubeResource"],
+    ) -> "KubeResource":
+        """
+        Apply a modifier to the runtime which is used to change the runtimes k8s object's spec.
+        All modifiers accept Kube, apply some changes on its spec and return it so modifiers can be chained
+        one after the other.
+
+        :param modifier: a modifier callable object
+        :return: the runtime (self) after the modifications
+        """
+        modifier(self)
+        if AutoMountType.is_auto_modifier(modifier):
+            self.spec.disable_auto_mount = True
+
+        api_client = k8s_client.ApiClient()
+        if self.spec.env:
+            for index, env in enumerate(
+                api_client.sanitize_for_serialization(self.spec.env)
+            ):
+                self.spec.env[index] = env
+
+        if self.spec.volumes and self.spec.volume_mounts:
+            vols = api_client.sanitize_for_serialization(self.spec.volumes)
+            mounts = api_client.sanitize_for_serialization(self.spec.volume_mounts)
+            self.spec.update_vols_and_mounts(vols, mounts)
+
+        return self
 
     def list_valid_priority_class_names(self):
         return mlconf.get_valid_function_priority_class_names()
@@ -1347,19 +1532,25 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
 
     def _build_image(
         self,
-        builder_env,
-        force_build,
-        mlrun_version_specifier,
-        show_on_failure,
-        skip_deployed,
-        watch,
-        is_kfp,
-        with_mlrun,
+        builder_env: dict,
+        force_build: bool,
+        mlrun_version_specifier: typing.Optional[bool],
+        show_on_failure: bool,
+        skip_deployed: bool,
+        watch: bool,
+        is_kfp: bool,
+        with_mlrun: typing.Optional[bool],
     ):
         # When we're in pipelines context we must watch otherwise the pipelines pod will exit before the operation
         # is actually done. (when a pipelines pod exits, the pipeline step marked as done)
         if is_kfp:
             watch = True
+
+        if skip_deployed and self.requires_build() and not self.is_deployed():
+            logger.warning(
+                f"Even though {skip_deployed=}, the build might be triggered due to the function's configuration. "
+                "See requires_build() and is_deployed() for reasoning."
+            )
 
         db = self._get_db()
         data = db.remote_builder(
@@ -1387,15 +1578,13 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
                 f"Started building image: {data.get('data', {}).get('spec', {}).get('build', {}).get('image')}"
             )
         if watch and not ready:
-            state = self._build_watch(
+            self.status.state = self._build_watch(
                 watch=watch,
                 show_on_failure=show_on_failure,
             )
-            ready = state == "ready"
-            self.status.state = state
-
-        if watch and not ready:
-            raise mlrun.errors.MLRunRuntimeError("Deploy failed")
+            ready = self.status.state == "ready"
+            if not ready:
+                raise mlrun.errors.MLRunRuntimeError("Deploy failed")
         return ready
 
     def _build_watch(
@@ -1406,20 +1595,32 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
     ):
         db = self._get_db()
         offset = 0
+        events_offset = 0
         try:
-            text, _ = db.get_builder_status(self, 0, logs=logs)
+            text, _, deploy_status_text_kind = db.get_builder_status(
+                self,
+                offset=0,
+                logs=logs,
+                events_offset=0,
+            )
         except mlrun.db.RunDBError:
-            raise ValueError("function or build process not found")
+            raise ValueError("Function or build process not found")
 
-        def print_log(text):
-            if text and (
+        def print_log(_text):
+            if _text and (
                 not show_on_failure
                 or self.status.state == mlrun.common.schemas.FunctionState.error
             ):
-                print(text, end="")
+                print(_text, end="")
 
         print_log(text)
-        offset += len(text)
+        if (
+            deploy_status_text_kind
+            == mlrun.common.constants.DeployStatusTextKind.events
+        ):
+            events_offset += len(text)
+        else:
+            offset += len(text)
         if watch:
             while self.status.state in [
                 mlrun.common.schemas.FunctionState.pending,
@@ -1428,14 +1629,30 @@ class KubeResource(BaseRuntime, KfpAdapterMixin):
                 time.sleep(2)
                 if show_on_failure:
                     text = ""
-                    db.get_builder_status(self, 0, logs=False)
+                    db.get_builder_status(self, offset=0, logs=False, events_offset=0)
                     if self.status.state == mlrun.common.schemas.FunctionState.error:
                         # re-read the full log on failure
-                        text, _ = db.get_builder_status(self, offset, logs=logs)
+                        text, _, deploy_status_text_kind = db.get_builder_status(
+                            self,
+                            offset=offset,
+                            logs=logs,
+                            events_offset=events_offset,
+                        )
                 else:
-                    text, _ = db.get_builder_status(self, offset, logs=logs)
+                    text, _, deploy_status_text_kind = db.get_builder_status(
+                        self,
+                        offset=offset,
+                        logs=logs,
+                        events_offset=events_offset,
+                    )
                 print_log(text)
-                offset += len(text)
+                if (
+                    deploy_status_text_kind
+                    == mlrun.common.constants.DeployStatusTextKind.events
+                ):
+                    events_offset += len(text)
+                else:
+                    offset += len(text)
 
         return self.status.state
 

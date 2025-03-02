@@ -1,0 +1,679 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "target": {
+          "limit": 100,
+          "matchAny": false,
+          "tags": [],
+          "type": "dashboard"
+        },
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": 27,
+  "links": [
+    {
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "title": "Model Monitoring - Performance",
+      "type": "link",
+      "url": "/d/9CazA-UGz/model-monitoring-performance"
+    },
+    {
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "title": "Model Monitoring - Overview",
+      "type": "link",
+      "url": "d/g0M4uh0Mz/model-monitoring-overview"
+    },
+    {
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Model Monitoring - Applications",
+      "type": "link",
+      "url": "d/gVrVlU7Iz/model-monitoring-applications"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": "model-monitoring",
+      "description": "A summary table of the selected model endpoint, with the following fields:\n\n- **Name**: The model endpoint name.\n- **Endpoint ID**: The unique identifier for the model endpoint.\n- **Function**: The name of the function.\n- **Model Class**: The model object class (e.g., `SKLearnModelServer`).\n- **Error Count**: The total number of errors.\n- **Sampling Percentage**: The sampling rate percentage. By default (100), all events are sampled.\n- **Drift Status**: The drift status indicator, currently based on the `general_drift` result from the histogram default application.\n\nNote that this table reflects the current system status and is not influenced by the selected time range.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "displayMode": "auto",
+            "filterable": false,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Drift Status (Last 24H)"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "0": {
+                        "color": "green",
+                        "index": 0,
+                        "text": "Stable"
+                      },
+                      "1": {
+                        "color": "orange",
+                        "index": 2,
+                        "text": "Potential Drift"
+                      },
+                      "2": {
+                        "color": "red",
+                        "index": 3,
+                        "text": "Detected"
+                      },
+                      "-1": {
+                        "index": 1,
+                        "text": "N/A"
+                      }
+                    },
+                    "type": "value"
+                  }
+                ]
+              },
+              {
+                "id": "custom.displayMode",
+                "value": "color-background"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/./"
+            },
+            "properties": [
+              {
+                "id": "custom.align",
+                "value": "center"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 22,
+      "options": {
+        "footer": {
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": false,
+            "displayName": "name"
+          }
+        ]
+      },
+      "pluginVersion": "9.2.20",
+      "targets": [
+        {
+          "datasource": "model-monitoring",
+          "hide": false,
+          "rawQuery": true,
+          "refId": "A",
+          "target": "target_endpoint=list_endpoints;project=$PROJECT;uids=$MODELENDPOINT",
+          "type": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "endpoint_model": true
+            },
+            "indexByName": {
+              "drift_status": 7,
+              "endpoint_function": 2,
+              "endpoint_id": 1,
+              "endpoint_model": 3,
+              "endpoint_model_class": 4,
+              "endpoint_name": 0,
+              "error_count": 5,
+              "sampling_percentage": 6
+            },
+            "renameByName": {
+              "drift_status": "Drift Status (Last 24H)",
+              "endpoint_function": "Function",
+              "endpoint_id": "Endpoint ID",
+              "endpoint_model": "Model",
+              "endpoint_model_class": "Model Class",
+              "endpoint_name": "Name",
+              "error_count": "Errors",
+              "sampling_percentage": "Sampling Percentage"
+            }
+          }
+        }
+      ],
+      "transparent": true,
+      "type": "table"
+    },
+    {
+      "datasource": "iguazio",
+      "description": "Drift value over time, based on the general_drift result from the histogram data drift application. The drift value is calculated as the average of Total Variance Distance and Hellinger Distance. The default thresholds are 0.5 for potential drift and 0.7 for detected drift.\nFor more information about the default drift analysis please visit:",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "seriesBy": "last"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "points",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineStyle": {
+              "dash": [
+                0,
+                10
+              ],
+              "fill": "dot"
+            },
+            "lineWidth": 1,
+            "pointSize": 12,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed+area"
+            }
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 0.7
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 13,
+        "x": 0,
+        "y": 3
+      },
+      "id": 28,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "MLRun Docs - Model Monitoring",
+          "url": "https://docs.mlrun.org/en/stable/model-monitoring/index.html#:~:text=Total%20Variation%20Distance,reference%20probability%20distribution"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "9.2.20",
+      "targets": [
+        {
+          "datasource": "iguazio",
+          "rawQuery": true,
+          "refId": "A",
+          "target": "backend=tsdb;\ncontainer=users;\ntable=pipelines/$PROJECT/monitoring-apps/app-results/;\nfilter=endpoint_id=='$MODELENDPOINT' AND application_name=='histogram-data-drift';",
+          "type": "timeserie"
+        }
+      ],
+      "title": "Drift Analysis",
+      "transformations": [
+        {
+          "id": "seriesToRows",
+          "options": {}
+        },
+        {
+          "id": "extractFields",
+          "options": {
+            "format": "kvp",
+            "replace": false,
+            "source": "Metric"
+          }
+        },
+        {
+          "id": "filterByValue",
+          "options": {
+            "filters": [
+              {
+                "config": {
+                  "id": "regex",
+                  "options": {
+                    "value": ".*result_value\\[(.*)\\]"
+                  }
+                },
+                "fieldName": "Metric"
+              }
+            ],
+            "match": "any",
+            "type": "include"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Metric": true,
+              "endpoint_id": true,
+              "endpoint_name[application_name": true,
+              "result_extra_data[application_name": true,
+              "result_kind[application_name": true,
+              "result_name": true,
+              "result_status[application_name": true,
+              "result_value[application_name": true,
+              "start_infer_time[application_name": true
+            },
+            "indexByName": {},
+            "renameByName": {}
+          }
+        }
+      ],
+      "transparent": true,
+      "type": "timeseries"
+    },
+    {
+      "datasource": "iguazio",
+      "description": "This chart shows the metrics of the default histogram application over time. For more details on these metrics, please visit:",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "#ccccdc",
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "points",
+            "fillOpacity": 20,
+            "gradientMode": "scheme",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 3,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 10,
+        "x": 13,
+        "y": 3
+      },
+      "id": 26,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "MLRun Docs - Model Monitoring",
+          "url": "https://docs.mlrun.org/en/stable/model-monitoring/index.html#:~:text=Total%20Variation%20Distance,reference%20probability%20distribution."
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "9.2.20",
+      "targets": [
+        {
+          "datasource": "iguazio",
+          "hide": false,
+          "rawQuery": true,
+          "refId": "A",
+          "target": "backend=tsdb;\ncontainer=users;\ntable=pipelines/$PROJECT/monitoring-apps/metrics/;\nfilter=endpoint_id=='$MODELENDPOINT' AND metric_name=='hellinger_mean';",
+          "type": "table"
+        },
+        {
+          "datasource": "iguazio",
+          "hide": false,
+          "refId": "B",
+          "target": "backend=tsdb; container=users; table=pipelines/$PROJECT/monitoring-apps/metrics/; filter=endpoint_id=='$MODELENDPOINT' AND metric_name=='tvd_mean';",
+          "type": "table"
+        },
+        {
+          "datasource": "iguazio",
+          "hide": false,
+          "refId": "C",
+          "target": "backend=tsdb; container=users; table=pipelines/$PROJECT/monitoring-apps/metrics/; filter=endpoint_id=='$MODELENDPOINT' AND metric_name=='kld_mean';",
+          "type": "table"
+        }
+      ],
+      "title": "Overall Drift Analysis by Time",
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "application_name": true,
+              "endpoint_id": true,
+              "endpoint_name": true,
+              "metric_value": false,
+              "result_extra_data": true,
+              "result_kind": true,
+              "result_status": true,
+              "start_infer_time": true,
+              "time": false
+            },
+            "indexByName": {},
+            "renameByName": {
+              "endpoint_name": "",
+              "metric_name": "",
+              "metric_value": "",
+              "result_kind": "",
+              "result_name": "Metric",
+              "result_status": "",
+              "result_value": "Value",
+              "start_infer_time": ""
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "metric_name",
+            "rowField": "time",
+            "valueField": "metric_value"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "hellinger_mean": "Hellinger Mean",
+              "kld_mean": "KLD Mean",
+              "time\\metric_name": "Time",
+              "tvd_mean": "TVD Mean"
+            }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "destinationType": "time",
+                "targetField": "Time"
+              }
+            ],
+            "fields": {}
+          }
+        }
+      ],
+      "transparent": true,
+      "type": "timeseries"
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": "iguazio",
+      "description": "Data sampling of the model's input and output over time.",
+      "fill": 1,
+      "fillGradient": 1,
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      },
+      "hiddenSeries": false,
+      "id": 16,
+      "legend": {
+        "alignAsTable": true,
+        "avg": false,
+        "current": true,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "sideWidth": 250,
+        "total": false,
+        "values": true
+      },
+      "lines": true,
+      "linewidth": 1,
+      "nullPointMode": "null",
+      "options": {
+        "alertThreshold": true
+      },
+      "percentage": false,
+      "pluginVersion": "9.2.20",
+      "pointradius": 2,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "datasource": "iguazio",
+          "rawQuery": true,
+          "refId": "A",
+          "target": "backend=tsdb;\ncontainer=users;\ntable=pipelines/$PROJECT/model-endpoints/events;\nfilter=endpoint_id=='$MODELENDPOINT'  AND record_type=='endpoint_features';",
+          "type": "timeserie"
+        }
+      ],
+      "thresholds": [],
+      "timeRegions": [],
+      "title": "Incoming Features",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "transformations": [],
+      "transparent": true,
+      "type": "graph",
+      "xaxis": {
+        "mode": "time",
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "short",
+          "logBase": 1,
+          "show": true
+        },
+        {
+          "format": "short",
+          "logBase": 1,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 37,
+  "style": "dark",
+  "tags": [],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": "model-monitoring",
+        "definition": "target_endpoint=list_projects",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Project",
+        "multi": false,
+        "name": "PROJECT",
+        "options": [],
+        "query": "target_endpoint=list_projects",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "tagValuesQuery": "",
+        "tagsQuery": "",
+        "type": "query",
+        "useTags": false
+      },
+      {
+        "current": {},
+        "datasource": "model-monitoring",
+        "definition": "target_endpoint=list_endpoints;project=$PROJECT",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Model Endpoint",
+        "multi": false,
+        "name": "MODELENDPOINT",
+        "options": [],
+        "query": "target_endpoint=list_endpoints;project=$PROJECT",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Model Monitoring - Details",
+  "uid": "AohIXhAMk",
+  "version": 14,
+  "weekStart": ""
+}

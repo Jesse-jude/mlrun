@@ -36,7 +36,16 @@ from ..utils import (
 
 
 class ArtifactMetadata(ModelObj):
-    _dict_fields = ["key", "project", "iter", "tree", "description", "hash", "tag"]
+    _dict_fields = [
+        "key",
+        "project",
+        "iter",
+        "tree",
+        "description",
+        "hash",
+        "tag",
+        "uid",
+    ]
     _extra_fields = ["updated", "labels"]
 
     def __init__(
@@ -48,6 +57,7 @@ class ArtifactMetadata(ModelObj):
         description=None,
         hash=None,
         tag=None,
+        uid=None,
     ):
         self.key = key
         self.project = project
@@ -58,18 +68,26 @@ class ArtifactMetadata(ModelObj):
         self.labels = {}
         self.updated = None
         self.tag = tag  # temp store of the tag
+        self.uid = uid
 
     def base_dict(self):
         return super().to_dict()
 
-    def to_dict(self, fields: list = None, exclude: list = None, strip: bool = False):
+    def to_dict(
+        self,
+        fields: typing.Optional[list] = None,
+        exclude: typing.Optional[list] = None,
+        strip: bool = False,
+    ):
         """return long dict form of the artifact"""
         return super().to_dict(
             self._dict_fields + self._extra_fields, exclude=exclude, strip=strip
         )
 
     @classmethod
-    def from_dict(cls, struct=None, fields=None, deprecated_fields: dict = None):
+    def from_dict(
+        cls, struct=None, fields=None, deprecated_fields: typing.Optional[dict] = None
+    ):
         fields = fields or cls._dict_fields + cls._extra_fields
         return super().from_dict(
             struct, fields=fields, deprecated_fields=deprecated_fields
@@ -109,7 +127,7 @@ class ArtifactSpec(ModelObj):
         db_key=None,
         extra_data=None,
         body=None,
-        unpackaging_instructions: dict = None,
+        unpackaging_instructions: typing.Optional[dict] = None,
     ):
         self.src_path = src_path
         self.target_path = target_path
@@ -131,14 +149,21 @@ class ArtifactSpec(ModelObj):
     def base_dict(self):
         return super().to_dict()
 
-    def to_dict(self, fields: list = None, exclude: list = None, strip: bool = False):
+    def to_dict(
+        self,
+        fields: typing.Optional[list] = None,
+        exclude: typing.Optional[list] = None,
+        strip: bool = False,
+    ):
         """return long dict form of the artifact"""
         return super().to_dict(
             self._dict_fields + self._extra_fields, exclude=exclude, strip=strip
         )
 
     @classmethod
-    def from_dict(cls, struct=None, fields=None, deprecated_fields: dict = None):
+    def from_dict(
+        cls, struct=None, fields=None, deprecated_fields: typing.Optional[dict] = None
+    ):
         fields = fields or cls._dict_fields + cls._extra_fields
         return super().from_dict(
             struct, fields=fields, deprecated_fields=deprecated_fields
@@ -192,7 +217,7 @@ class Artifact(ModelObj):
         size=None,
         target_path=None,
         project=None,
-        src_path: str = None,
+        src_path: typing.Optional[str] = None,
         # All params up until here are legacy params for compatibility with legacy artifacts.
         # TODO: remove them in 1.9.0.
         metadata: ArtifactMetadata = None,
@@ -354,6 +379,7 @@ class Artifact(ModelObj):
             iter=self.metadata.iter,
             tree=tree,
             tag=tag,
+            uid=self.uid,
         )
         return mlrun.datastore.get_store_uri(self._store_prefix, uri)
 
@@ -366,7 +392,7 @@ class Artifact(ModelObj):
                 struct[field] = val.base_dict()
         return struct
 
-    def upload(self, artifact_path: str = None):
+    def upload(self, artifact_path: typing.Optional[str] = None):
         """
         internal, upload to target store
         :param artifact_path: required only for when generating target_path from artifact hash
@@ -379,7 +405,9 @@ class Artifact(ModelObj):
             if src_path and os.path.isfile(src_path):
                 self._upload_file(source_path=src_path, artifact_path=artifact_path)
 
-    def _upload_body(self, body, target=None, artifact_path: str = None):
+    def _upload_body(
+        self, body, target=None, artifact_path: typing.Optional[str] = None
+    ):
         body_hash = None
         if not target and not self.spec.target_path:
             if not mlrun.mlconf.artifacts.generate_target_path_from_artifact_hash:
@@ -400,7 +428,10 @@ class Artifact(ModelObj):
         )
 
     def _upload_file(
-        self, source_path: str, target_path: str = None, artifact_path: str = None
+        self,
+        source_path: str,
+        target_path: typing.Optional[str] = None,
+        artifact_path: typing.Optional[str] = None,
     ):
         file_hash = None
         if not target_path and not self.spec.target_path:
@@ -623,6 +654,14 @@ class Artifact(ModelObj):
     def hash(self, hash):
         self.metadata.hash = hash
 
+    @property
+    def uid(self):
+        return self.metadata.uid
+
+    @uid.setter
+    def uid(self, uid):
+        self.metadata.uid = uid
+
     def generate_target_path(self, artifact_path, producer):
         return generate_target_path(self, artifact_path, producer)
 
@@ -632,6 +671,7 @@ class DirArtifactSpec(ArtifactSpec):
         "src_path",
         "target_path",
         "db_key",
+        "producer",
     ]
 
 
@@ -650,7 +690,7 @@ class DirArtifact(Artifact):
     def is_dir(self):
         return True
 
-    def upload(self, artifact_path: str = None):
+    def upload(self, artifact_path: typing.Optional[str] = None):
         """
         internal, upload to target store
         :param artifact_path: required only for when generating target_path from artifact hash
@@ -757,13 +797,17 @@ def upload_extra_data(
     extra_data: dict,
     prefix="",
     update_spec=False,
-    artifact_path: str = None,
+    artifact_path: typing.Optional[str] = None,
 ):
     """upload extra data to the artifact store"""
     if not extra_data:
         return
     target_path = artifact.target_path
     for key, item in extra_data.items():
+        if item is ...:
+            # Skip future links (packagers feature for linking artifacts before they are logged)
+            continue
+
         if isinstance(item, bytes):
             if target_path:
                 target = os.path.join(target_path, prefix + key)

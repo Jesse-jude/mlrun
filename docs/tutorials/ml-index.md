@@ -4,7 +4,7 @@
 (quick-start-tutorial)=
 
 ````{card} Make sure you start with the Quick start tutorial to understand the basics
-```{button-link} ./01-mlrun-basics.html
+```{button-link} ./01-mlrun-basics.ipynb
 :color: primary
 :shadow:
 :expand:
@@ -16,6 +16,7 @@ Introduction to MLRun - Use serverless functions to train and deploy models
 ```{toctree}
 :maxdepth: 1
 :hidden:
+01-mlrun-basics
 02-model-training
 03-model-serving
 04-pipeline
@@ -27,14 +28,14 @@ mlflow
 ```
 
 
-Each of the following tutorials is a dedicated Jupyter notebook. You can download them by clicking the download icon <img src="../_static/images/icon-download.png">at the top of each page.
+Each of the following tutorials is a dedicated Jupyter notebook. You can download them by clicking the download icon <img src="../_static/images/icon-download.png"> at the top of each page.
 
-
+- {ref}`quick-start-ml`
 - {ref}`model-training-tutorial`
 - {ref}`serving-ml-dl-models`
 - {ref}`projects-auto-ml-pipe`
 - {ref}`realtime-monitor-drift-tutor`
-- {ref}`batch-infor-draft-tutor`
+- {ref}`batch-infer-drift-tutor`
 - {ref}`add-mlops-to-code`
-- {ref}`mlfow-tracker`
+- {ref}`mlflow-tracker`
 - {ref}`basic-demo` 

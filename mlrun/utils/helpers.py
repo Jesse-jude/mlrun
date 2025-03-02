@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import base64
 import enum
 import functools
+import gzip
 import hashlib
 import inspect
 import itertools
@@ -23,13 +25,16 @@ import os
 import re
 import string
 import sys
+import traceback
 import typing
+import uuid
 import warnings
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib import import_module, reload
 from os import path
 from types import ModuleType
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import git
 import inflection
@@ -39,18 +44,23 @@ import pandas
 import semver
 import yaml
 from dateutil import parser
-from mlrun_pipelines.models import PipelineRun
-from pandas._libs.tslibs.timestamps import Timedelta, Timestamp
+from pandas import Timedelta, Timestamp
 from yaml.representer import RepresenterError
 
 import mlrun
+import mlrun.common.constants as mlrun_constants
 import mlrun.common.helpers
+import mlrun.common.runtimes.constants as runtimes_constants
 import mlrun.common.schemas
 import mlrun.errors
 import mlrun.utils.regex
 import mlrun.utils.version.version
+import mlrun_pipelines.common.constants
+import mlrun_pipelines.models
+import mlrun_pipelines.utils
 from mlrun.common.constants import MYSQL_MEDIUMBLOB_SIZE_BYTES
 from mlrun.config import config
+from mlrun_pipelines.models import PipelineRun
 
 from .logger import create_logger
 from .retryer import (  # noqa: F401
@@ -84,14 +94,19 @@ class StorePrefix:
     Artifact = "artifacts"
     Model = "models"
     Dataset = "datasets"
+    Document = "documents"
 
     @classmethod
     def is_artifact(cls, prefix):
-        return prefix in [cls.Artifact, cls.Model, cls.Dataset]
+        return prefix in [cls.Artifact, cls.Model, cls.Dataset, cls.Document]
 
     @classmethod
     def kind_to_prefix(cls, kind):
-        kind_map = {"model": cls.Model, "dataset": cls.Dataset}
+        kind_map = {
+            "model": cls.Model,
+            "dataset": cls.Dataset,
+            "document": cls.Document,
+        }
         return kind_map.get(kind, cls.Artifact)
 
     @classmethod
@@ -102,6 +117,7 @@ class StorePrefix:
             cls.Dataset,
             cls.FeatureSet,
             cls.FeatureVector,
+            cls.Document,
         ]
 
 
@@ -110,12 +126,21 @@ def get_artifact_target(item: dict, project=None):
     project_str = project or item["metadata"].get("project")
     tree = item["metadata"].get("tree")
     tag = item["metadata"].get("tag")
+    iter = item["metadata"].get("iter")
+    kind = item.get("kind")
+    uid = item["metadata"].get("uid")
 
-    if item.get("kind") in {"dataset", "model", "artifact"} and db_key:
-        target = f"{DB_SCHEMA}://{StorePrefix.Artifact}/{project_str}/{db_key}"
+    if kind in {"dataset", "model", "artifact"} and db_key:
+        target = (
+            f"{DB_SCHEMA}://{StorePrefix.kind_to_prefix(kind)}/{project_str}/{db_key}"
+        )
+        if iter:
+            target = f"{target}#{iter}"
         target += f":{tag}" if tag else ":latest"
         if tree:
             target += f"@{tree}"
+        if uid:
+            target += f"^{uid}"
         return target
 
     return item["spec"].get("target_path")
@@ -132,18 +157,25 @@ def is_legacy_artifact(artifact):
 logger = create_logger(config.log_level, config.log_formatter, "mlrun", sys.stdout)
 missing = object()
 
-is_ipython = False
+is_ipython = False  # is IPython terminal, including Jupyter
+is_jupyter = False  # is Jupyter notebook/lab terminal
 try:
-    import IPython
+    import IPython.core.getipython
 
-    ipy = IPython.get_ipython()
-    # if its IPython terminal ignore (cant show html)
-    if ipy and "Terminal" not in str(type(ipy)):
-        is_ipython = True
-except ImportError:
+    ipy = IPython.core.getipython.get_ipython()
+
+    is_ipython = ipy is not None
+    is_jupyter = (
+        is_ipython
+        # not IPython
+        and "Terminal" not in str(type(ipy))
+    )
+
+    del ipy
+except ModuleNotFoundError:
     pass
 
-if is_ipython and config.nest_asyncio_enabled in ["1", "True"]:
+if is_jupyter and config.nest_asyncio_enabled in ["1", "True"]:
     # bypass Jupyter asyncio bug
     import nest_asyncio
 
@@ -156,6 +188,7 @@ class RunKeys:
     inputs = "inputs"
     returns = "returns"
     artifacts = "artifacts"
+    artifact_uris = "artifact_uris"
     outputs = "outputs"
     data_stores = "data_stores"
     secrets = "secret_sources"
@@ -209,7 +242,7 @@ def verify_field_regex(
 
 
 def validate_builder_source(
-    source: str, pull_at_runtime: bool = False, workdir: str = None
+    source: str, pull_at_runtime: bool = False, workdir: Optional[str] = None
 ):
     if pull_at_runtime or not source:
         return
@@ -257,12 +290,14 @@ def validate_tag_name(
 def validate_artifact_key_name(
     artifact_key: str, field_name: str, raise_on_failure: bool = True
 ) -> bool:
+    field_type = "key" if field_name == "artifact.key" else "db_key"
     return mlrun.utils.helpers.verify_field_regex(
         field_name,
         artifact_key,
         mlrun.utils.regex.artifact_key,
         raise_on_failure=raise_on_failure,
-        log_message="Slashes are not permitted in the artifact key (both \\ and /)",
+        log_message=f"Artifact {field_type} must start and end with an alphanumeric character, and may only contain "
+        "letters, numbers, hyphens, underscores, and dots.",
     )
 
 
@@ -343,8 +378,8 @@ def verify_field_list_of_type(
 def verify_dict_items_type(
     name: str,
     dictionary: dict,
-    expected_keys_types: list = None,
-    expected_values_types: list = None,
+    expected_keys_types: Optional[list] = None,
+    expected_values_types: Optional[list] = None,
 ):
     if dictionary:
         if not isinstance(dictionary, dict):
@@ -361,7 +396,7 @@ def verify_dict_items_type(
             ) from exc
 
 
-def verify_list_items_type(list_, expected_types: list = None):
+def verify_list_items_type(list_, expected_types: Optional[list] = None):
     if list_ and expected_types:
         list_items_types = set(map(type, list_))
         expected_types = set(expected_types)
@@ -383,6 +418,32 @@ def get_pretty_types_names(types):
 
 def now_date(tz: timezone = timezone.utc) -> datetime:
     return datetime.now(tz=tz)
+
+
+def datetime_to_mysql_ts(datetime_object: datetime) -> datetime:
+    """
+    Convert a Python datetime object to a MySQL-compatible timestamp string,
+    rounded to the nearest millisecond.
+    Example: 2024-12-18T16:36:05.235687+00:00 -> 2024-12-18T16:36:05.236000
+
+    :param datetime_object: A Python datetime object.
+
+    :return: A MySQL-compatible timestamp string with millisecond precision.
+    """
+    if not datetime_object.tzinfo:
+        datetime_object = datetime_object.replace(tzinfo=timezone.utc)
+
+    # Round to the nearest millisecond
+    ms = round(datetime_object.microsecond / 1000) * 1000
+    if ms == 1000000:
+        datetime_object += timedelta(seconds=1)
+        ms = 0
+
+    return datetime_object.replace(microsecond=ms)
+
+
+def datetime_min(tz: timezone = timezone.utc) -> datetime:
+    return datetime(1970, 1, 1, tzinfo=tz)
 
 
 datetime_now = now_date
@@ -652,8 +713,8 @@ def dict_to_json(struct):
 
 def parse_artifact_uri(uri, default_project=""):
     """
-    Parse artifact URI into project, key, tag, iter, tree
-    URI format: [<project>/]<key>[#<iter>][:<tag>][@<tree>]
+    Parse artifact URI into project, key, tag, iter, tree, uid
+    URI format: [<project>/]<key>[#<iter>][:<tag>][@<tree>][^<uid>]
 
     :param uri:            uri to parse
     :param default_project: default project name if not in URI
@@ -663,6 +724,7 @@ def parse_artifact_uri(uri, default_project=""):
         [2] = iteration
         [3] = tag
         [4] = tree
+        [5] = uid
     """
     uri_pattern = mlrun.utils.regex.artifact_uri_pattern
     match = re.match(uri_pattern, uri)
@@ -687,6 +749,7 @@ def parse_artifact_uri(uri, default_project=""):
         iteration,
         group_dict["tag"],
         group_dict["tree"],
+        group_dict["uid"],
     )
 
 
@@ -701,7 +764,9 @@ def generate_object_uri(project, name, tag=None, hash_key=None):
     return uri
 
 
-def generate_artifact_uri(project, key, tag=None, iter=None, tree=None):
+def generate_artifact_uri(
+    project, key, tag=None, iter=None, tree=None, uid=None
+) -> str:
     artifact_uri = f"{project}/{key}"
     if iter is not None:
         artifact_uri = f"{artifact_uri}#{iter}"
@@ -709,6 +774,8 @@ def generate_artifact_uri(project, key, tag=None, iter=None, tree=None):
         artifact_uri = f"{artifact_uri}:{tag}"
     if tree is not None:
         artifact_uri = f"{artifact_uri}@{tree}"
+    if uid is not None:
+        artifact_uri = f"{artifact_uri}^{uid}"
     return artifact_uri
 
 
@@ -805,7 +872,9 @@ def _convert_python_package_version_to_image_tag(version: typing.Optional[str]):
 
 
 def enrich_image_url(
-    image_url: str, client_version: str = None, client_python_version: str = None
+    image_url: str,
+    client_version: Optional[str] = None,
+    client_python_version: Optional[str] = None,
 ) -> str:
     client_version = _convert_python_package_version_to_image_tag(client_version)
     server_version = _convert_python_package_version_to_image_tag(
@@ -845,7 +914,7 @@ def enrich_image_url(
 
 
 def resolve_image_tag_suffix(
-    mlrun_version: str = None, python_version: str = None
+    mlrun_version: Optional[str] = None, python_version: Optional[str] = None
 ) -> str:
     """
     resolves what suffix should be appended to the image tag
@@ -978,32 +1047,103 @@ async def retry_until_successful_async(
     ).run()
 
 
-def get_ui_url(project, uid=None):
-    url = ""
+def get_project_url(project: str) -> str:
+    """
+    Generate the base URL for a given project.
+
+    :param project: The project name.
+    :return: The base URL for the project, or an empty string if the base URL is not resolved.
+    """
     if mlrun.mlconf.resolve_ui_url():
-        url = f"{mlrun.mlconf.resolve_ui_url()}/{mlrun.mlconf.ui.projects_prefix}/{project}/jobs"
-        if uid:
-            url += f"/monitor/{uid}/overview"
+        return f"{mlrun.mlconf.resolve_ui_url()}/{mlrun.mlconf.ui.projects_prefix}/{project}"
+    return ""
+
+
+def get_run_url(project: str, uid: str, name: str) -> str:
+    """
+    Generate the URL for a specific run.
+
+    :param project: The project name.
+    :param uid: The run UID.
+    :param name: The run name.
+    :return: The URL for the run, or an empty string if the base URL is not resolved.
+    """
+    runs_url = get_runs_url(project)
+    if not runs_url:
+        return ""
+    return f"{runs_url}/monitor-jobs/{name}/{uid}/overview"
+
+
+def get_runs_url(project: str) -> str:
+    """
+    Generate the URL for the runs of a given project.
+
+    :param project: The project name.
+    :return: The URL for the runs, or an empty string if the base URL is not resolved.
+    """
+    base_url = get_project_url(project)
+    if not base_url:
+        return ""
+    return f"{base_url}/jobs"
+
+
+def get_model_endpoint_url(
+    project: str,
+    model_name: Optional[str] = None,
+    model_endpoint_id: Optional[str] = None,
+) -> str:
+    """
+    Generate the URL for a specific model endpoint.
+
+    :param project: The project name.
+    :param model_name: The model name.
+    :param model_endpoint_id: The model endpoint ID.
+    :return: The URL for the model endpoint, or an empty string if the base URL is not resolved.
+    """
+    base_url = get_project_url(project)
+    if not base_url:
+        return ""
+    url = f"{base_url}/models"
+    if model_name and model_endpoint_id:
+        url += f"/model-endpoints/{model_name}/{model_endpoint_id}/overview"
     return url
 
 
-def get_model_endpoint_url(project, model_name, model_endpoint_id):
-    url = ""
-    if mlrun.mlconf.resolve_ui_url():
-        url = f"{mlrun.mlconf.resolve_ui_url()}/{mlrun.mlconf.ui.projects_prefix}/{project}/models"
-        if model_name:
-            url += f"/model-endpoints/{model_name}/{model_endpoint_id}/overview"
+def get_workflow_url(
+    project: str,
+    id: Optional[str] = None,
+) -> str:
+    """
+    Generate the URL for a specific workflow.
+
+    :param project: The project name.
+    :param id: The workflow ID.
+    :return: The URL for the workflow, or an empty string if the base URL is not resolved.
+    """
+    base_url = get_project_url(project)
+    if not base_url:
+        return ""
+    url = f"{base_url}/jobs/monitor-workflows/workflow"
+    if id:
+        url += f"/{id}"
     return url
 
 
-def get_workflow_url(project, id=None):
-    url = ""
-    if mlrun.mlconf.resolve_ui_url():
-        url = (
-            f"{mlrun.mlconf.resolve_ui_url()}/{mlrun.mlconf.ui.projects_prefix}"
-            f"/{project}/jobs/monitor-workflows/workflow/{id}"
-        )
-    return url
+def get_kfp_project_filter(project_name: str) -> str:
+    """
+    Generates a filter string for KFP runs, using a substring predicate
+    on the run's 'name' field. This is used as a heuristic to retrieve runs that are associated
+    with a specific project. The 'op: 9' operator indicates that the filter checks if the
+    project name appears as a substring in the run's name, ensuring that we can identify
+    runs belonging to the desired project.
+    """
+    is_substring_op = 9
+    project_name_filter = {
+        "predicates": [
+            {"key": "name", "op": is_substring_op, "string_value": project_name}
+        ]
+    }
+    return json.dumps(project_name_filter)
 
 
 def are_strings_in_exception_chain_messages(
@@ -1147,7 +1287,7 @@ def get_function(function, namespaces, reload_modules: bool = False):
 def get_handler_extended(
     handler_path: str,
     context=None,
-    class_args: dict = None,
+    class_args: Optional[dict] = None,
     namespaces=None,
     reload_modules: bool = False,
 ):
@@ -1189,7 +1329,11 @@ def get_handler_extended(
 def datetime_from_iso(time_str: str) -> Optional[datetime]:
     if not time_str:
         return
-    return parser.isoparse(time_str)
+    dt = parser.isoparse(time_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    # ensure the datetime is in UTC, converting if necessary
+    return dt.astimezone(timezone.utc)
 
 
 def datetime_to_iso(time_obj: Optional[datetime]) -> Optional[str]:
@@ -1198,14 +1342,24 @@ def datetime_to_iso(time_obj: Optional[datetime]) -> Optional[str]:
     return time_obj.isoformat()
 
 
-def enrich_datetime_with_tz_info(timestamp_string):
+def enrich_datetime_with_tz_info(timestamp_string) -> Optional[datetime]:
     if not timestamp_string:
         return timestamp_string
 
     if timestamp_string and not mlrun.utils.helpers.has_timezone(timestamp_string):
         timestamp_string += datetime.now(timezone.utc).astimezone().strftime("%z")
 
-    return datetime.strptime(timestamp_string, "%Y-%m-%d %H:%M:%S.%f%z")
+    for _format in [
+        # e.g: 2021-08-25 12:00:00.000Z
+        "%Y-%m-%d %H:%M:%S.%f%z",
+        # e.g: 2024-11-11 07:44:56+0000
+        "%Y-%m-%d %H:%M:%S%z",
+    ]:
+        try:
+            return datetime.strptime(timestamp_string, _format)
+        except ValueError as exc:
+            last_exc = exc
+    raise last_exc
 
 
 def has_timezone(timestamp):
@@ -1271,6 +1425,17 @@ def to_non_empty_values_dict(input_dict: dict) -> dict:
     return {key: value for key, value in input_dict.items() if value}
 
 
+def get_enriched_gpu_limits(function_limits: dict) -> dict[str, int]:
+    """
+    Creates new limits containing the GPU-related limits from the function's limits,
+    mapping each to zero. This is used for pods like Kaniko and Argo pods, which inherit
+    GPU-related selectors but do not require GPU resources. By setting these
+    limits to zero, the pods receive the necessary tolerations from the cloud provider for scheduling,
+    without actually consuming GPU resources.
+    """
+    return {resource: 0 for resource in function_limits if "/gpu" in resource.lower()}
+
+
 def str_to_timestamp(time_str: str, now_time: Timestamp = None):
     """convert fixed/relative time string to Pandas Timestamp
 
@@ -1307,6 +1472,16 @@ def str_to_timestamp(time_str: str, now_time: Timestamp = None):
         return timestamp
 
     return Timestamp(time_str)
+
+
+def str_to_bool(value: str) -> bool:
+    """Convert a string to a boolean value."""
+    value = value.lower()
+    if value in ("true", "1", "t", "y", "yes", "on"):
+        return True
+    if value in ("false", "0", "f", "n", "no", "off"):
+        return False
+    raise ValueError(f"invalid boolean value: {value}")
 
 
 def is_link_artifact(artifact):
@@ -1403,11 +1578,27 @@ def is_running_in_jupyter_notebook() -> bool:
     Check if the code is running inside a Jupyter Notebook.
     :return: True if running inside a Jupyter Notebook, False otherwise.
     """
-    import IPython
+    return is_jupyter
 
-    ipy = IPython.get_ipython()
-    # if its IPython terminal, it isn't a Jupyter ipython
-    return ipy and "Terminal" not in str(type(ipy))
+
+def create_ipython_display():
+    """
+    Create an IPython display object and fill it with initial content.
+    We can later use the returned display_id with the update_display method to update the content.
+    If IPython is not installed, a warning will be logged and None will be returned.
+    """
+    if is_ipython:
+        import IPython
+
+        display_id = uuid.uuid4().hex
+        content = IPython.display.HTML(
+            f'<div id="{display_id}">Temporary Display Content</div>'
+        )
+        IPython.display.display(content, display_id=display_id)
+        return display_id
+
+    # returning None if IPython is not installed, this method shouldn't be called in that case but logging for sanity
+    logger.debug("IPython is not installed, cannot create IPython display")
 
 
 def as_number(field_name, field_value):
@@ -1571,7 +1762,9 @@ setting partitioned=False"""
 
 def is_ecr_url(registry: str) -> bool:
     # example URL: <aws_account_id>.dkr.ecr.<region>.amazonaws.com
-    return ".ecr." in registry and ".amazonaws.com" in registry
+    parsed_url = urlparse(f"https://{registry}")
+    hostname = parsed_url.hostname
+    return hostname and ".ecr." in hostname and hostname.endswith(".amazonaws.com")
 
 
 def get_local_file_schema() -> list:
@@ -1606,7 +1799,14 @@ def get_serving_spec():
             raise mlrun.errors.MLRunInvalidArgumentError(
                 "Failed to find serving spec in env var or config file"
             )
-    spec = json.loads(data)
+    # Attempt to decode and decompress, or use as-is for backward compatibility
+    try:
+        decoded_data = base64.b64decode(data)
+        decompressed_data = gzip.decompress(decoded_data)
+        spec = json.loads(decompressed_data.decode("utf-8"))
+    except (OSError, gzip.BadGzipFile, base64.binascii.Error, json.JSONDecodeError):
+        spec = json.loads(data)
+
     return spec
 
 
@@ -1618,42 +1818,44 @@ def additional_filters_warning(additional_filters, class_name):
         )
 
 
-def merge_with_precedence(first_dict: dict, second_dict: dict) -> dict:
+def merge_dicts_with_precedence(*dicts: dict) -> dict:
     """
-    Merge two dictionaries with precedence given to keys from the second dictionary.
+    Merge multiple dictionaries with precedence given to keys from later dictionaries.
 
-    This function merges two dictionaries, `first_dict` and `second_dict`, where keys from `second_dict`
-    take precedence in case of conflicts. If both dictionaries contain the same key,
-    the value from `second_dict` will overwrite the value from `first_dict`.
+    This function merges an arbitrary number of dictionaries, where keys from dictionaries later
+    in the argument list take precedence over keys from dictionaries earlier in the list. If all
+    dictionaries contain the same key, the value from the last dictionary with that key will
+    overwrite the values from earlier dictionaries.
 
     Example:
         >>> first_dict = {"key1": "value1", "key2": "value2"}
         >>> second_dict = {"key2": "new_value2", "key3": "value3"}
-        >>> merge_with_precedence(first_dict, second_dict)
-        {'key1': 'value1', 'key2': 'new_value2', 'key3': 'value3'}
+        >>> third_dict = {"key3": "new_value3", "key4": "value4"}
+        >>> merge_dicts_with_precedence(first_dict, second_dict, third_dict)
+        {'key1': 'value1', 'key2': 'new_value2', 'key3': 'new_value3', 'key4': 'value4'}
 
-    Note:
-    - The merge operation uses the ** operator in Python, which combines key-value pairs
-      from each dictionary. Later dictionaries take precedence when there are conflicting keys.
+    - If no dictionaries are provided, the function returns an empty dictionary.
     """
-    return {
-        **(first_dict or {}),
-        **(second_dict or {}),
-    }
+    return {k: v for d in dicts if d for k, v in d.items()}
 
 
 def validate_component_version_compatibility(
-    component_name: typing.Literal["iguazio", "nuclio"], *min_versions: str
+    component_name: typing.Literal["iguazio", "nuclio", "mlrun-client"],
+    *min_versions: str,
+    mlrun_client_version: Optional[str] = None,
 ):
     """
     :param component_name: Name of the component to validate compatibility for.
     :param min_versions: Valid minimum version(s) required, assuming no 2 versions has equal major and minor.
+    :param mlrun_client_version: Client version to validate when component_name is "mlrun-client".
     """
     parsed_min_versions = [
         semver.VersionInfo.parse(min_version) for min_version in min_versions
     ]
     parsed_current_version = None
     component_current_version = None
+    # For mlrun client we don't assume compatability if we fail to parse the client version
+    assume_compatible = component_name not in ["mlrun-client"]
     try:
         if component_name == "iguazio":
             component_current_version = mlrun.mlconf.igz_version
@@ -1670,24 +1872,45 @@ def validate_component_version_compatibility(
             parsed_current_version = semver.VersionInfo.parse(
                 mlrun.mlconf.nuclio_version
             )
+        if component_name == "mlrun-client":
+            # dev version, assume compatible
+            if mlrun_client_version and (
+                mlrun_client_version.startswith("0.0.0+")
+                or "unstable" in mlrun_client_version
+            ):
+                return True
+
+            component_current_version = mlrun_client_version
+            parsed_current_version = semver.Version.parse(mlrun_client_version)
         if not parsed_current_version:
-            return True
+            return assume_compatible
     except ValueError:
         # only log when version is set but invalid
         if component_current_version:
             logger.warning(
-                "Unable to parse current version, assuming compatibility",
+                "Unable to parse current version",
                 component_name=component_name,
                 current_version=component_current_version,
                 min_versions=min_versions,
+                assume_compatible=assume_compatible,
             )
-        return True
+        return assume_compatible
 
+    # Feature might have been back-ported e.g. nuclio node selection is supported from
+    # 1.5.20 and 1.6.10 but not in 1.6.9 - therefore we reverse sort to validate against 1.6.x 1st and
+    # then against 1.5.x
     parsed_min_versions.sort(reverse=True)
     for parsed_min_version in parsed_min_versions:
-        if parsed_current_version < parsed_min_version:
+        if (
+            parsed_current_version.major == parsed_min_version.major
+            and parsed_current_version.minor == parsed_min_version.minor
+            and parsed_current_version.patch < parsed_min_version.patch
+        ):
             return False
-    return True
+
+        if parsed_current_version >= parsed_min_version:
+            return True
+    return False
 
 
 def format_alert_summary(
@@ -1731,3 +1954,218 @@ def _reload(module, max_recursion_depth):
         attribute = getattr(module, attribute_name)
         if type(attribute) is ModuleType:
             _reload(attribute, max_recursion_depth - 1)
+
+
+def run_with_retry(
+    retry_count: int,
+    func: typing.Callable,
+    retry_on_exceptions: Optional[
+        typing.Union[type[Exception], tuple[type[Exception]]]
+    ] = None,
+    *args,
+    **kwargs,
+):
+    """
+    Executes a function with retry logic upon encountering specified exceptions.
+
+    :param retry_count: The number of times to retry the function execution.
+    :param func: The function to execute.
+    :param retry_on_exceptions: Exception(s) that trigger a retry. Can be a single exception or a tuple of exceptions.
+    :param args: Positional arguments to pass to the function.
+    :param kwargs: Keyword arguments to pass to the function.
+    :return: The result of the function execution if successful.
+    :raises Exception: Re-raises the last exception encountered after all retries are exhausted.
+    """
+    if retry_on_exceptions is None:
+        retry_on_exceptions = (Exception,)
+    elif isinstance(retry_on_exceptions, list):
+        retry_on_exceptions = tuple(retry_on_exceptions)
+
+    last_exception = None
+    for attempt in range(retry_count + 1):
+        try:
+            return func(*args, **kwargs)
+        except retry_on_exceptions as exc:
+            last_exception = exc
+            logger.warning(
+                f"Attempt {{{attempt}/ {retry_count}}} failed with exception: {exc}",
+            )
+            if attempt == retry_count:
+                raise
+    raise last_exception
+
+
+def join_urls(base_url: Optional[str], path: Optional[str]) -> str:
+    """
+    Joins a base URL with a path, ensuring proper handling of slashes.
+
+    :param base_url: The base URL (e.g., "http://example.com").
+    :param path: The path to append to the base URL (e.g., "/path/to/resource").
+
+    :return: A unified URL with exactly one slash between base_url and path.
+    """
+    if base_url is None:
+        base_url = ""
+    return f"{base_url.rstrip('/')}/{path.lstrip('/')}" if path else base_url
+
+
+class Workflow:
+    @staticmethod
+    def get_workflow_steps(workflow_id: str, project: str) -> list:
+        steps = []
+        db = mlrun.get_run_db()
+
+        def _add_run_step(_step: mlrun_pipelines.models.PipelineStep):
+            try:
+                _run = db.list_runs(
+                    project=project,
+                    labels=f"{mlrun_constants.MLRunInternalLabels.runner_pod}={_step.node_name}",
+                )[0]
+            except IndexError:
+                _run = {
+                    "metadata": {
+                        "name": _step.display_name,
+                        "project": project,
+                    },
+                }
+            _run["step_kind"] = _step.step_type
+            if _step.skipped:
+                _run.setdefault("status", {})["state"] = (
+                    runtimes_constants.RunStates.skipped
+                )
+            steps.append(_run)
+
+        def _add_deploy_function_step(_step: mlrun_pipelines.models.PipelineStep):
+            project, name, hash_key = Workflow._extract_function_uri(
+                _step.get_annotation("mlrun/function-uri")
+            )
+            if name:
+                try:
+                    function = db.get_function(
+                        project=project, name=name, hash_key=hash_key
+                    )
+                except mlrun.errors.MLRunNotFoundError:
+                    # If the function is not found (if build failed for example), we will create a dummy
+                    # function object for the notification to display the function name
+                    function = {
+                        "metadata": {
+                            "name": name,
+                            "project": project,
+                            "hash_key": hash_key,
+                        },
+                    }
+                pod_phase = _step.phase
+                if _step.skipped:
+                    state = mlrun.common.schemas.FunctionState.skipped
+                else:
+                    state = runtimes_constants.PodPhases.pod_phase_to_run_state(
+                        pod_phase
+                    )
+                function["status"] = {"state": state}
+                if isinstance(function["metadata"].get("updated"), datetime):
+                    function["metadata"]["updated"] = function["metadata"][
+                        "updated"
+                    ].isoformat()
+                function["step_kind"] = _step.step_type
+                steps.append(function)
+
+        step_methods = {
+            mlrun_pipelines.common.constants.PipelineRunType.run: _add_run_step,
+            mlrun_pipelines.common.constants.PipelineRunType.build: _add_deploy_function_step,
+            mlrun_pipelines.common.constants.PipelineRunType.deploy: _add_deploy_function_step,
+        }
+
+        if not workflow_id:
+            return steps
+
+        try:
+            workflow_manifest = Workflow._get_workflow_manifest(workflow_id)
+        except Exception:
+            logger.warning(
+                "Failed to extract workflow steps from workflow manifest, "
+                "returning all runs with the workflow id label",
+                workflow_id=workflow_id,
+                traceback=traceback.format_exc(),
+            )
+            return db.list_runs(
+                project=project,
+                labels=f"workflow={workflow_id}",
+            )
+
+        if not workflow_manifest:
+            return steps
+
+        try:
+            for step in workflow_manifest.get_steps():
+                step_method = step_methods.get(step.step_type)
+                if step_method:
+                    step_method(step)
+            return steps
+        except Exception:
+            # If we fail to read the pipeline steps, we will return the list of runs that have the same workflow id
+            logger.warning(
+                "Failed to extract workflow steps from workflow manifest, "
+                "returning all runs with the workflow id label",
+                workflow_id=workflow_id,
+                traceback=traceback.format_exc(),
+            )
+            return db.list_runs(
+                project=project,
+                labels=f"workflow={workflow_id}",
+            )
+
+    @staticmethod
+    def _extract_function_uri(function_uri: str) -> tuple[str, str, str]:
+        """
+        Extract the project, name, and hash key from a function uri.
+        Examples:
+            - "project/name@hash_key" returns project, name, hash_key
+            - "project/name returns" project, name, ""
+        """
+        project, name, hash_key = None, None, None
+        hashed_pattern = r"^(.+)/(.+)@(.+)$"
+        pattern = r"^(.+)/(.+)$"
+        match = re.match(hashed_pattern, function_uri)
+        if match:
+            project, name, hash_key = match.groups()
+        else:
+            match = re.match(pattern, function_uri)
+            if match:
+                project, name = match.groups()
+                hash_key = ""
+        return project, name, hash_key
+
+    @staticmethod
+    def _get_workflow_manifest(
+        workflow_id: str,
+    ) -> typing.Optional[mlrun_pipelines.models.PipelineManifest]:
+        kfp_client = mlrun_pipelines.utils.get_client(mlrun.mlconf.kfp_url)
+
+        # arbitrary timeout of 5 seconds, the workflow should be done by now
+        kfp_run = kfp_client.wait_for_run_completion(workflow_id, 5)
+        if not kfp_run:
+            return None
+
+        kfp_run = mlrun_pipelines.models.PipelineRun(kfp_run)
+        return kfp_run.workflow_manifest()
+
+
+def as_dict(data: typing.Union[dict, str]) -> dict:
+    if isinstance(data, str):
+        return json.loads(data)
+    return data
+
+
+def encode_user_code(
+    user_code: typing.Union[str, bytes], max_len_warning: typing.Optional[int] = None
+) -> str:
+    max_len_warning = max_len_warning or config.function.spec.source_code_max_bytes
+    if isinstance(user_code, str):
+        user_code = user_code.encode("utf-8")
+    encoded = base64.b64encode(user_code).decode("utf-8")
+    if len(encoded) > max_len_warning:
+        logger.warning(
+            f"User code exceeds the maximum allowed size of {max_len_warning} bytes for non remote source. "
+            "Consider using `with_source_archive` to add user code as a remote source to the function."
+        )
+    return encoded

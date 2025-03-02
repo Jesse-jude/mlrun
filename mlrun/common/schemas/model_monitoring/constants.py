@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import hashlib
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import Optional
 
@@ -28,6 +29,56 @@ class MonitoringStrEnum(StrEnum):
         return list(map(lambda c: c.value, cls))
 
 
+class ModelEndpointSchema(MonitoringStrEnum):
+    # metadata
+    UID = "uid"
+    PROJECT = "project"
+    ENDPOINT_TYPE = "endpoint_type"
+    NAME = "name"
+    CREATED = "created"
+    UPDATED = "updated"
+    LABELS = "labels"
+
+    # spec
+    FUNCTION_NAME = "function_name"
+    FUNCTION_TAG = "function_tag"
+    FUNCTION_UID = "function_uid"
+    MODEL_NAME = "model_name"
+    MODEL_DB_KEY = "model_db_key"
+    MODEL_TAG = "model_tag"
+    MODEL_CLASS = "model_class"
+    MODEL_UID = "model_uid"
+    FEATURE_NAMES = "feature_names"
+    LABEL_NAMES = "label_names"
+    FEATURE_STATS = "feature_stats"
+    MONITORING_FEATURE_SET_URI = "monitoring_feature_set_uri"
+    CHILDREN = "children"
+    CHILDREN_UIDS = "children_uids"
+    FUNCTION_URI = "function_uri"
+    MODEL_URI = "model_uri"
+
+    # status
+    STATE = "state"
+    MONITORING_MODE = "monitoring_mode"
+    FIRST_REQUEST = "first_request"
+    SAMPLING_PERCENTAGE = "sampling_percentage"
+
+    # status - operative
+    LAST_REQUEST = "last_request"
+    RESULT_STATUS = "result_status"
+    AVG_LATENCY = "avg_latency"
+    ERROR_COUNT = "error_count"
+    CURRENT_STATS = "current_stats"
+    DRIFT_MEASURES = "drift_measures"
+
+
+class ModelEndpointCreationStrategy(MonitoringStrEnum):
+    INPLACE = "inplace"
+    ARCHIVE = "archive"
+    OVERWRITE = "overwrite"
+    SKIP = "skip"
+
+
 class EventFieldType:
     FUNCTION_URI = "function_uri"
     FUNCTION = "function"
@@ -39,6 +90,7 @@ class EventFieldType:
     TIMESTAMP = "timestamp"
     # `endpoint_id` is deprecated as a field in the model endpoint schema since 1.3.1, replaced by `uid`.
     ENDPOINT_ID = "endpoint_id"
+    ENDPOINT_NAME = "endpoint_name"
     UID = "uid"
     ENDPOINT_TYPE = "endpoint_type"
     REQUEST_ID = "request_id"
@@ -53,9 +105,13 @@ class EventFieldType:
     PREDICTIONS = "predictions"
     NAMED_PREDICTIONS = "named_predictions"
     ERROR_COUNT = "error_count"
+    MODEL_ERROR = "model_error"
+    ERROR_TYPE = "error_type"
+    INFER_ERROR = "infer_error"
     ENTITIES = "entities"
     FIRST_REQUEST = "first_request"
     LAST_REQUEST = "last_request"
+    LAST_REQUEST_TIMESTAMP = "last_request_timestamp"
     METRIC = "metric"
     METRICS = "metrics"
     BATCH_INTERVALS_DICT = "batch_intervals_dict"
@@ -82,11 +138,14 @@ class EventFieldType:
     SAMPLE_PARQUET_PATH = "sample_parquet_path"
     TIME = "time"
     TABLE_COLUMN = "table_column"
+    SAMPLING_PERCENTAGE = "sampling_percentage"
+    SAMPLING_RATE = "sampling_rate"
+    ESTIMATED_PREDICTION_COUNT = "estimated_prediction_count"
+    EFFECTIVE_SAMPLE_COUNT = "effective_sample_count"
 
 
 class FeatureSetFeatures(MonitoringStrEnum):
     LATENCY = EventFieldType.LATENCY
-    ERROR_COUNT = EventFieldType.ERROR_COUNT
     METRICS = EventFieldType.METRICS
 
     @classmethod
@@ -102,29 +161,43 @@ class ApplicationEvent:
     APPLICATION_NAME = "application_name"
     START_INFER_TIME = "start_infer_time"
     END_INFER_TIME = "end_infer_time"
-    LAST_REQUEST = "last_request"
     ENDPOINT_ID = "endpoint_id"
-    OUTPUT_STREAM_URI = "output_stream_uri"
-    MLRUN_CONTEXT = "mlrun_context"
-
-    # Deprecated fields - TODO : delete in 1.9.0  (V1 app deprecation)
-    SAMPLE_PARQUET_PATH = "sample_parquet_path"
-    CURRENT_STATS = "current_stats"
-    FEATURE_STATS = "feature_stats"
+    ENDPOINT_NAME = "endpoint_name"
 
 
 class WriterEvent(MonitoringStrEnum):
+    ENDPOINT_NAME = "endpoint_name"
     APPLICATION_NAME = "application_name"
     ENDPOINT_ID = "endpoint_id"
     START_INFER_TIME = "start_infer_time"
     END_INFER_TIME = "end_infer_time"
-    EVENT_KIND = "event_kind"  # metric or result
+    EVENT_KIND = "event_kind"  # metric or result or stats
     DATA = "data"
 
 
 class WriterEventKind(MonitoringStrEnum):
     METRIC = "metric"
     RESULT = "result"
+    STATS = "stats"
+
+
+class ControllerEvent(MonitoringStrEnum):
+    KIND = "kind"
+    ENDPOINT_ID = "endpoint_id"
+    ENDPOINT_NAME = "endpoint_name"
+    PROJECT = "project"
+    TIMESTAMP = "timestamp"
+    FIRST_REQUEST = "first_request"
+    FEATURE_SET_URI = "feature_set_uri"
+    ENDPOINT_TYPE = "endpoint_type"
+    ENDPOINT_POLICY = "endpoint_policy"
+    # Note: currently under endpoint policy we will have a dictionary including the keys: "application_names"
+    # and "base_period"
+
+
+class ControllerEventKind(MonitoringStrEnum):
+    NOP_EVENT = "nop_event"
+    REGULAR_EVENT = "regular_event"
 
 
 class MetricData(MonitoringStrEnum):
@@ -138,7 +211,17 @@ class ResultData(MonitoringStrEnum):
     RESULT_KIND = "result_kind"
     RESULT_STATUS = "result_status"
     RESULT_EXTRA_DATA = "result_extra_data"
+
+
+class StatsData(MonitoringStrEnum):
+    STATS_NAME = "stats_name"
+    STATS = "stats"
+    TIMESTAMP = "timestamp"
+
+
+class StatsKind(MonitoringStrEnum):
     CURRENT_STATS = "current_stats"
+    DRIFT_MEASURES = "drift_measures"
 
 
 class EventLiveStats:
@@ -157,53 +240,28 @@ class EventKeyMetrics:
     REAL_TIME = "real_time"
 
 
-class ModelEndpointTarget(MonitoringStrEnum):
-    V3IO_NOSQL = "v3io-nosql"
-    SQL = "sql"
-
-
-class StreamKind(MonitoringStrEnum):
-    V3IO_STREAM = "v3io_stream"
-    KAFKA = "kafka"
-
-
 class TSDBTarget(MonitoringStrEnum):
     V3IO_TSDB = "v3io-tsdb"
     TDEngine = "tdengine"
-    PROMETHEUS = "prometheus"
 
 
 class ProjectSecretKeys:
-    ENDPOINT_STORE_CONNECTION = "MODEL_MONITORING_ENDPOINT_STORE_CONNECTION"
     ACCESS_KEY = "MODEL_MONITORING_ACCESS_KEY"
-    STREAM_PATH = "STREAM_PATH"
-    TSDB_CONNECTION = "TSDB_CONNECTION"
+    TSDB_PROFILE_NAME = "TSDB_PROFILE_NAME"
+    STREAM_PROFILE_NAME = "STREAM_PROFILE_NAME"
 
     @classmethod
     def mandatory_secrets(cls):
         return [
-            cls.ENDPOINT_STORE_CONNECTION,
-            cls.STREAM_PATH,
-            cls.TSDB_CONNECTION,
+            cls.STREAM_PROFILE_NAME,
+            cls.TSDB_PROFILE_NAME,
         ]
 
 
-class ModelEndpointTargetSchemas(MonitoringStrEnum):
-    V3IO = "v3io"
-    MYSQL = "mysql"
-    SQLITE = "sqlite"
-
-
-class ModelMonitoringStoreKinds:
-    ENDPOINTS = "endpoints"
-    EVENTS = "events"
-
-
-class SchedulingKeys:
-    LAST_ANALYZED = "last_analyzed"
-    ENDPOINT_ID = "endpoint_id"
-    APPLICATION_NAME = "application_name"
-    UID = "uid"
+class GetEventsFormat(MonitoringStrEnum):
+    SINGLE = "single"
+    SEPARATION = "separation"
+    INTERSECTION = "intersection"
 
 
 class FileTargetKind:
@@ -214,13 +272,13 @@ class FileTargetKind:
     PARQUET = "parquet"
     APPS_PARQUET = "apps_parquet"
     LOG_STREAM = "log_stream"
-    APP_RESULTS = "app_results"
-    APP_METRICS = "app_metrics"
     MONITORING_SCHEDULES = "monitoring_schedules"
     MONITORING_APPLICATION = "monitoring_application"
+    ERRORS = "errors"
+    STATS = "stats"
 
 
-class ModelMonitoringMode(str, Enum):
+class ModelMonitoringMode(StrEnum):
     enabled = "enabled"
     disabled = "disabled"
 
@@ -229,21 +287,11 @@ class EndpointType(IntEnum):
     NODE_EP = 1  # end point that is not a child of a router
     ROUTER = 2  # endpoint that is router
     LEAF_EP = 3  # end point that is a child of a router
+    BATCH_EP = 4  # endpoint that is representing an offline batch endpoint
 
-
-class PrometheusMetric:
-    PREDICTIONS_TOTAL = "predictions_total"
-    MODEL_LATENCY_SECONDS = "model_latency_seconds"
-    INCOME_FEATURES = "income_features"
-    ERRORS_TOTAL = "errors_total"
-    DRIFT_METRICS = "drift_metrics"
-    DRIFT_STATUS = "drift_status"
-
-
-class PrometheusEndpoints(MonitoringStrEnum):
-    MODEL_MONITORING_METRICS = "/model-monitoring-metrics"
-    MONITORING_BATCH_METRICS = "/monitoring-batch-metrics"
-    MONITORING_DRIFT_STATUS = "/monitoring-drift-status"
+    @classmethod
+    def top_level_list(cls):
+        return [cls.NODE_EP, cls.ROUTER, cls.BATCH_EP]
 
 
 class MonitoringFunctionNames(MonitoringStrEnum):
@@ -256,12 +304,15 @@ class V3IOTSDBTables(MonitoringStrEnum):
     APP_RESULTS = "app-results"
     METRICS = "metrics"
     EVENTS = "events"
+    ERRORS = "errors"
+    PREDICTIONS = "predictions"
 
 
 class TDEngineSuperTables(MonitoringStrEnum):
     APP_RESULTS = "app_results"
     METRICS = "metrics"
     PREDICTIONS = "predictions"
+    ERRORS = "errors"
 
 
 @dataclass
@@ -307,7 +358,7 @@ class EndpointUID:
     function_hash_key: str
     model: str
     model_version: str
-    uid: Optional[str] = None
+    uid: str = field(init=False)
 
     def __post_init__(self):
         function_ref = (
@@ -362,10 +413,6 @@ class ModelMonitoringAppLabel:
         return f"{self.KEY}={self.VAL}"
 
 
-class ControllerPolicy:
-    BASE_PERIOD = "base_period"
-
-
 class HistogramDataDriftApplicationConstants:
     NAME = "histogram-data-drift"
     GENERAL_RESULT_NAME = "general_drift"
@@ -383,4 +430,29 @@ class SpecialApps:
 _RESERVED_FUNCTION_NAMES = MonitoringFunctionNames.list() + [SpecialApps.MLRUN_INFRA]
 
 
-V3IO_MODEL_MONITORING_DB = "v3io"
+class ModelEndpointMonitoringMetricType(StrEnum):
+    RESULT = "result"
+    METRIC = "metric"
+
+
+_FQN_PART_PATTERN = r"[a-zA-Z0-9_-]+"
+FQN_PATTERN = (
+    rf"^(?P<project>{_FQN_PART_PATTERN})\."
+    rf"(?P<app>{_FQN_PART_PATTERN})\."
+    rf"(?P<type>{ModelEndpointMonitoringMetricType.RESULT}|{ModelEndpointMonitoringMetricType.METRIC})\."
+    rf"(?P<name>{_FQN_PART_PATTERN})$"
+)
+FQN_REGEX = re.compile(FQN_PATTERN)
+
+# refer to `mlrun.utils.regex.project_name`
+PROJECT_PATTERN = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+MODEL_ENDPOINT_ID_PATTERN = r"^[a-zA-Z0-9_-]+$"
+RESULT_NAME_PATTERN = r"[a-zA-Z_][a-zA-Z0-9_]*"
+
+INTERSECT_DICT_KEYS = {
+    ModelEndpointMonitoringMetricType.METRIC: "intersect_metrics",
+    ModelEndpointMonitoringMetricType.RESULT: "intersect_results",
+}
+
+CRON_TRIGGER_KINDS = ("http", "cron")
+STREAM_TRIGGER_KINDS = ("v3io-stream", "kafka-cluster")

@@ -11,3 +11,9 @@ working-with-rag
 evaluating-llms
 fine-tuning-llms
 ```
+
+**See also**
+- {ref}`genai_01_basic_tutorial`
+- {ref}`realtime-monitor-drift-tutor`
+- {ref}`model-monitoring-overview`
+- {ref}`alerts-notifications`

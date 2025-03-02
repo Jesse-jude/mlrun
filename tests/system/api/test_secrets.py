@@ -29,7 +29,7 @@ import mlrun.errors
 from mlrun.config import config
 from tests.system.base import TestMLRunSystem
 
-# This is a copy from server/api/utils/events/iguazio.py because the system tests simulate user env
+# This is a copy from server/py/services/api/utils/events/iguazio.py because the system tests simulate user env
 # where this module is not available
 PROJECT_SECRET_CREATED = "Security.Project.Secret.Created"
 PROJECT_SECRET_UPDATED = "Security.Project.Secret.Updated"
@@ -49,7 +49,7 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
         self._run_db.delete_project_secrets(self.project_name, provider="kubernetes")
 
         # create secret
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         self.project.set_secrets(secrets=secrets)
 
         self._ensure_audit_events(
@@ -59,7 +59,7 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
             secret_key,
         )
 
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         another_secret_key = str(uuid.uuid4())
         secrets.update({another_secret_key: "one"})
         self.project.set_secrets(secrets=secrets)
@@ -71,7 +71,7 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
         )
 
         # delete secrets
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         self._run_db.delete_project_secrets(self.project_name, provider="kubernetes")
         self._ensure_audit_events(
             PROJECT_SECRET_DELETED,
@@ -98,7 +98,7 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
         }
 
         # ensure no project secrets
-        start = datetime.datetime.utcnow()
+        start = datetime.datetime.now(datetime.timezone.utc)
         self._run_db.delete_project_secrets(self.project_name, provider="kubernetes")
         time.sleep(1)
         audit_events = igz_mgmt.AuditEvent.list(
@@ -106,12 +106,12 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
             filter_by={
                 "source": "mlrun-api",
                 "kind": PROJECT_SECRET_DELETED,
-                "timestamp_iso8601": f"[$ge]{start.isoformat()}Z",
+                "timestamp_iso8601": f"[$ge]{start.isoformat()}",
             },
         )
         assert len(audit_events) == 0
 
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         self.project.set_secrets(secrets=secrets)
         self._ensure_audit_events(
             PROJECT_SECRET_CREATED,
@@ -121,7 +121,7 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
         )
 
         # delete 1 of the secrets
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         self._run_db.delete_project_secrets(
             self.project_name, provider="kubernetes", secrets=[secret_key1]
         )
@@ -135,7 +135,7 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
         )
 
         # delete all secrets
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         self._run_db.delete_project_secrets(self.project_name, provider="kubernetes")
         self._ensure_audit_events(
             PROJECT_SECRET_DELETED,
@@ -145,7 +145,7 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
         )
 
         # delete the secret-less project
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         self._run_db.delete_project(
             self.project_name, mlrun.common.schemas.DeletionStrategy.cascade
         )
@@ -157,7 +157,7 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
             filter_by={
                 "source": "mlrun-api",
                 "kind": PROJECT_SECRET_DELETED,
-                "timestamp_iso8601": f"[$ge]{now.isoformat()}Z",
+                "timestamp_iso8601": f"[$ge]{now.isoformat()}",
             },
         )
         assert len(audit_events) == 0
@@ -168,11 +168,12 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
             filter_by={
                 "source": "mlrun-api",
                 "kind": PROJECT_SECRET_DELETED,
-                "timestamp_iso8601": f"[$ge]{start.isoformat()}Z",
+                "timestamp_iso8601": f"[$ge]{start.isoformat()}",
             },
         )
         assert len(audit_events) == 1
 
+    @pytest.mark.smoke
     def test_k8s_project_secrets_using_api(self):
         secrets = {"secret1": "value1", "secret2": "value2"}
         data = {"provider": "kubernetes", "secrets": secrets}
@@ -303,13 +304,18 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
             )
 
     def test_k8s_project_secrets_with_runtime(self):
-        secrets = {"secret1": "JustMySecret", "secret2": "!@#$$%^^&&"}
+        # This test validates both retrieval flows:
+        # 1. Secrets accessed via get_secret_or_env
+        # 2. Secrets accessed directly from os.environ when use_prefix=False.
+
+        secrets = {"secret1": "JustMySecret", "SECRET2": "!@#$$%^^&&"}
+        no_prefix_secrets = {"secret3": "ShhItsASecret", "SECRET4": "AnotherSecret"}
 
         # Setup k8s secrets
         self._run_db.delete_project_secrets(self.project_name, provider="kubernetes")
         self._run_db.create_project_secrets(self.project_name, "kubernetes", secrets)
 
-        # Run a function using k8s secrets
+        # Function setup
         filename = str(pathlib.Path(__file__).parent / "assets" / "function.py")
         function = mlrun.code_to_function(
             name="test-func",
@@ -320,29 +326,52 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
             image="mlrun/mlrun",
         )
 
-        # Try running without using with_secrets at all, using the auto-add feature
-        task = mlrun.new_task()
-        run = function.run(task, params={"secrets": list(secrets.keys())})
-        for key, value in secrets.items():
-            assert run.outputs[key] == value
+        test_cases = [
+            {
+                # Run without explicitly passing any secrets. Validate the auto-add feature
+                "task": mlrun.new_task(),
+                "params": list(secrets.keys()),
+                "expected": secrets,
+            },
+            {
+                # Run with an empty list of secrets. Validate that all secrets are still auto-added
+                "task": mlrun.new_task().with_secrets("kubernetes", []),
+                "params": list(secrets.keys()),
+                "expected": secrets,
+            },
+            {
+                # Run with all secret keys explicitly passed. Validate that the correct values are retrieved
+                "task": mlrun.new_task().with_secrets(
+                    "kubernetes", list(secrets.keys())
+                ),
+                "params": list(secrets.keys()),
+                "expected": secrets,
+            },
+            {
+                # Run with only a partial list of secret keys. Validate that only specified secrets are accessible
+                "task": mlrun.new_task().with_secrets("kubernetes", ["secret1"]),
+                "params": list(secrets.keys()),
+                "expected": {"secret1": secrets["secret1"], "SECRET2": "None"},
+            },
+        ]
 
-        # Test running with an empty list of secrets
-        task = mlrun.new_task().with_secrets("kubernetes", [])
-        run = function.run(task, params={"secrets": list(secrets.keys())})
-        for key, value in secrets.items():
-            assert run.outputs[key] == value
+        for case in test_cases:
+            run = function.run(
+                case["task"],
+                params={"secrets": case["params"]},
+            )
+            for key, value in case["expected"].items():
+                assert run.outputs[key] == value
 
-        # And with actual secret keys
-        task = mlrun.new_task().with_secrets("kubernetes", list(secrets.keys()))
-        run = function.run(task, params={"secrets": list(secrets.keys())})
-        for key, value in secrets.items():
-            assert run.outputs[key] == value
-
-        # Verify that when running with a partial list of secrets, only these secrets are available
-        task = mlrun.new_task().with_secrets("kubernetes", ["secret1"])
-        run = function.run(task, params={"secrets": list(secrets.keys())})
-        expected = {"secret1": secrets["secret1"], "secret2": "None"}
-        for key, value in expected.items():
+        # Validate that the correct values are retrieved directly from environment variables
+        self._run_db.create_project_secrets(
+            self.project_name, "kubernetes", no_prefix_secrets
+        )
+        run = function.run(
+            mlrun.new_task().with_secrets("kubernetes", list(no_prefix_secrets.keys())),
+            params={"secrets": list(no_prefix_secrets.keys()), "use_prefix": False},
+        )
+        for key, value in no_prefix_secrets.items():
             assert run.outputs[key] == value
 
         # Cleanup secrets
@@ -442,7 +471,7 @@ class TestKubernetesProjectSecrets(TestMLRunSystem):
                 filter_by={
                     "source": "mlrun-api",
                     "kind": event_kind,
-                    "timestamp_iso8601": f"[$ge]{since_time.isoformat()}Z",
+                    "timestamp_iso8601": f"[$ge]{since_time.isoformat()}",
                 },
             )
             assert len(audit_events) > 0
